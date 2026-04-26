@@ -1,13 +1,32 @@
 """MCP server entry point for claude-bridge.
 
 Runs over stdio so the host (Cowork, Claude Code, or any MCP client) can
-launch it via ``docker exec -i <container> claude-bridge``. Three tools are
-exposed:
+launch it via ``docker exec -i <container> claude-bridge``. The exposed
+tool surface comes in two halves:
 
-* ``dispatch(prompt, channel, ...)``  — run a prompt against Claude Code in
-  this container and return the result, pinning a session per channel.
-* ``list_channels()``                 — show channel→session_id map.
-* ``reset_channel(channel)``          — drop a channel's pinned session.
+* **Synchronous** (best when the round trip fits inside the MCP
+  transport's per-call ceiling, typically ~60s):
+
+  - ``dispatch(prompt, channel, ...)``       — run a prompt and return the
+    result, pinning a session per channel.
+
+* **Asynchronous** (best for prompts that exceed the MCP transport
+  ceiling — persona runs, multi-step refactors, anything that does real
+  work in a busy project):
+
+  - ``dispatch_async(prompt, channel, ...)`` — kick off in the background,
+    return a ``job_id`` immediately.
+  - ``get_dispatch(job_id)``                 — poll status, non-blocking.
+  - ``wait_dispatch(job_id, max_wait_seconds)`` — block up to ~50s for a
+    job, then return current state. Cowork polls this in a loop.
+  - ``cancel_dispatch(job_id)``              — kill a running job.
+  - ``list_jobs()``                           — summary of all tracked jobs.
+
+* **Channel admin** (no claude invocation):
+
+  - ``list_channels()``                       — channel→session_id map.
+  - ``reset_channel(channel)``                — drop a channel's pinned
+    session so the next dispatch starts fresh.
 
 Configuration is environment-only (set in the container, not negotiated over
 MCP):
@@ -103,6 +122,95 @@ async def dispatch(
         cwd=cwd,
     )
     return res.to_dict()
+
+
+@mcp.tool()
+async def dispatch_async(
+    prompt: str,
+    channel: str = "default",
+    timeout_seconds: int = 300,
+    permission_mode: str | None = None,
+    cwd: str | None = None,
+) -> dict:
+    """Kick off a dispatch in the background, return a ``job_id`` immediately.
+
+    Use this when the prompt may take longer than the MCP transport's
+    per-call ceiling (typically ~60s) — anything that does real work in a
+    busy project workspace. The returned ``job_id`` is the handle for
+    ``get_dispatch``, ``wait_dispatch``, and ``cancel_dispatch``.
+
+    Same-channel calls still serialize (the channel lock is held by the
+    background task), so concurrent ``dispatch_async`` on a single channel
+    will queue. Distinct channels run in parallel.
+
+    Args mirror ``dispatch``. Empty prompts are rejected synchronously
+    with a structured error (no job is created).
+
+    Returns::
+
+        {"job_id": "...", "channel": "...", "ok": true}
+
+    Or, on validation failure::
+
+        {"ok": false, "error": "prompt is empty"}
+    """
+    try:
+        job_id = await dispatcher.dispatch_async(
+            prompt=prompt,
+            channel=channel,
+            timeout_seconds=timeout_seconds,
+            permission_mode=permission_mode or _DEFAULT_PERMISSION_MODE,
+            cwd=cwd,
+        )
+    except ValueError as exc:
+        return {"ok": False, "error": str(exc)}
+    return {"ok": True, "job_id": job_id, "channel": channel}
+
+
+@mcp.tool()
+def get_dispatch(job_id: str) -> dict:
+    """Return the current state of a job. Non-blocking.
+
+    ``status`` is one of ``running``, ``done``, ``cancelled``, ``error``.
+    For ``done``, the returned dict carries the same fields as a
+    synchronous ``dispatch`` result (``result``, ``session_id``, etc.).
+    Unknown ``job_id`` returns ``{"ok": false, "error": ...}``.
+    """
+    return dispatcher.get_dispatch(job_id)
+
+
+@mcp.tool()
+async def wait_dispatch(job_id: str, max_wait_seconds: int = 50) -> dict:
+    """Block up to ``max_wait_seconds`` for a job, then return state.
+
+    Default 50s is intentionally below the typical MCP transport ceiling
+    (~60s) — call this in a loop until ``status != "running"``. The
+    underlying job is shielded from cancellation, so an aborted MCP call
+    on this poller doesn't kill the work in flight.
+    """
+    return await dispatcher.wait_dispatch(job_id, max_wait_seconds)
+
+
+@mcp.tool()
+def cancel_dispatch(job_id: str) -> dict:
+    """Request cancellation of a running job.
+
+    The task's ``CancelledError`` handler kills the underlying ``claude -p``
+    subprocess before propagating, so we don't leave headless workers
+    behind. Returns ``{"cancelled": true}`` if the request was sent;
+    ``{"cancelled": false, "reason": "already_finished"}`` if the job had
+    already returned.
+    """
+    return dispatcher.cancel_dispatch(job_id)
+
+
+@mcp.tool()
+def list_jobs() -> dict:
+    """Summary of every tracked job — running and finished.
+
+    Useful for diagnostics; not needed for normal dispatch flow.
+    """
+    return {"jobs": dispatcher.list_jobs()}
 
 
 @mcp.tool()

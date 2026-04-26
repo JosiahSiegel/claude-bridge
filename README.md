@@ -51,14 +51,27 @@ window) and relaunch. In a Cowork session, ask Claude to call
 
 **4. Dispatch.**
 
+For quick prompts (under ~60s round trip):
+
 ```
-dispatch(
+dispatch(prompt="say ok", channel="smoke")
+```
+
+For real work (anything that might exceed the MCP transport's per-call
+ceiling — persona runs, refactors, work in a busy project):
+
+```
+job = dispatch_async(
   prompt="audit the auth middleware",
   channel="auth-audit",
   cwd="/workspace",          # the project you want claude to work in
-  timeout_seconds=180
+  timeout_seconds=900
 )
+# Then poll wait_dispatch(job["job_id"], max_wait_seconds=50) in a loop.
 ```
+
+See [Tools → Polling pattern](#polling-pattern-the-canonical-long-running-flow)
+for the full pattern.
 
 ## Recommended pattern
 
@@ -81,14 +94,60 @@ individual dispatches at the project they actually want:
 `list_channels` and a bare `dispatch(prompt="say ok")` then stay snappy;
 heavy project work gets routed to the right cwd on demand.
 
+## Running unattended (max permissions)
+
+For autonomous operation — letting Cowork drive the bridge without
+permission prompts blocking dispatches — set the bridge's *default*
+permission mode to `bypassPermissions` in the MCP config:
+
+```json
+{
+  "mcpServers": {
+    "devcontainer-claude": {
+      "command": "docker",
+      "args": [
+        "exec", "-i",
+        "-e", "CLAUDE_BRIDGE_CWD=/home/vscode/claude-bridge",
+        "-e", "CLAUDE_BRIDGE_DEFAULT_PERMISSION_MODE=bypassPermissions",
+        "<container>",
+        "/absolute/path/to/claude-bridge"
+      ]
+    }
+  }
+}
+```
+
+Now every `dispatch(...)` without an explicit `permission_mode` runs as
+`bypassPermissions` — no Bash gates, no workspace sandbox. Cowork
+doesn't need to know the policy; it's enforced at the bridge. Individual
+dispatches can still opt into stricter behavior by passing
+`permission_mode="acceptEdits"` (or `"plan"`) per call.
+
+**Only do this when the container is the trust boundary** — the
+container's network and filesystem isolation is what's keeping bypassed
+permissions safe. Treat the MCP config as privileged: anyone who can
+edit it can run arbitrary commands in your container as the bridge
+user. See the [official devcontainer guide][devcontainer] for the
+recommended firewall config.
+
+[devcontainer]: https://code.claude.com/docs/en/devcontainer
+
 ## Tools
 
-### `dispatch(prompt, channel="default", timeout_seconds=300, permission_mode=None, cwd=None)`
+The tool surface comes in two halves. Use the synchronous `dispatch`
+when the round trip will fit comfortably under the MCP transport's
+per-call ceiling (~60s in Cowork). Use the async surface for anything
+longer — persona runs, multi-step refactors, work in a project with
+heavy `.claude/` config.
 
-Run a prompt against `claude -p` inside the container. Channels pin to
-one Claude Code session each — first call starts fresh, subsequent calls
-on the same channel `--resume` it. Distinct channels run in parallel;
-same-channel calls serialize.
+### Synchronous
+
+#### `dispatch(prompt, channel="default", timeout_seconds=300, permission_mode=None, cwd=None)`
+
+Run a prompt against `claude -p` and return the full result. Channels
+pin to one Claude Code session each — first call starts fresh,
+subsequent calls on the same channel `--resume` it. Distinct channels
+run in parallel; same-channel calls serialize.
 
 * `permission_mode`: `default`, `acceptEdits`, `plan`, or
   `bypassPermissions`. Defaults to `acceptEdits` (override via
@@ -101,14 +160,82 @@ Returns `{ok, channel, duration_ms, result, session_id, raw}` on
 success, or `{ok: false, channel, duration_ms, error, exit_code}` on
 failure. **Failures never raise** — the MCP layer always sees a result.
 
-### `list_channels()`
+### Asynchronous (long-running)
+
+#### `dispatch_async(prompt, channel="default", timeout_seconds=300, permission_mode=None, cwd=None)`
+
+Kick off a dispatch in the background; return a `job_id` immediately.
+Channel locking still applies — concurrent `dispatch_async` on the same
+channel queue up. Empty prompts surface as `{"ok": false, "error": ...}`
+synchronously (no orphan job).
+
+Returns `{ok: true, job_id, channel}`.
+
+#### `get_dispatch(job_id)`
+
+Non-blocking status read. `status` is one of:
+
+* `running` — also includes `elapsed_ms` so you can show progress.
+* `done` — full sync-style result keys (`ok`, `result`, `session_id`,
+  `duration_ms`, `raw`, …) plus `job_id` and `started_at`.
+* `cancelled` — caller cancelled and the subprocess was killed.
+* `error` — programmer error in the dispatcher itself; should be rare.
+
+Unknown `job_id` returns `{ok: false, error: ...}`.
+
+#### `wait_dispatch(job_id, max_wait_seconds=50)`
+
+Block up to `max_wait_seconds` for a job, then return whatever
+`get_dispatch` would return. **Default 50s is intentionally below the
+typical MCP transport ceiling** — Cowork polls this in a loop until
+`status != "running"`. The underlying job is shielded from cancellation,
+so an aborted poll doesn't kill the work in flight.
+
+#### `cancel_dispatch(job_id)`
+
+Request cancellation. The task's `CancelledError` handler kills the
+underlying `claude -p` subprocess before propagating, so we don't leave
+orphan workers. Idempotent: `{cancelled: true}` if cancellation was
+requested, `{cancelled: false, reason: "already_finished"}` otherwise.
+
+#### `list_jobs()`
+
+Diagnostics only — returns one summary dict per tracked job (running
+and recently finished). Job retention is bounded by `max_completed_jobs`
+(default 1000), so this is safe to call on a long-lived bridge.
+
+### Channel admin
+
+#### `list_channels()`
 
 `{"channels": {channel: session_id, ...}}`. Doesn't invoke `claude`.
+Always cheap — Cowork can call this safely while a long dispatch is
+running.
 
-### `reset_channel(channel)`
+#### `reset_channel(channel)`
 
 Drops a channel's pinned session so the next dispatch starts fresh.
-`{"reset": true|false, "channel": ...}`.
+`{"reset": true|false, "channel": ...}`. Useful when a project MCP
+server (playwright, neon, etc.) has wedged inside the channel's claude
+session and you want a clean reconnect.
+
+### Polling pattern (the canonical long-running flow)
+
+```
+job = dispatch_async(prompt="...", channel="...", cwd="/workspace",
+                     permission_mode="bypassPermissions",
+                     timeout_seconds=900)
+
+while True:
+    res = wait_dispatch(job["job_id"], max_wait_seconds=50)
+    if res["status"] != "running":
+        break
+    # optional: surface elapsed_ms, log, or just keep polling
+```
+
+`wait_dispatch` returning at the 50s mark with `status="running"` is the
+common case for real work; the loop just goes around again. When the
+job finishes, `wait_dispatch` returns immediately with the full result.
 
 ## Configuration (env vars in the container)
 
@@ -144,6 +271,8 @@ container's env reaches `claude` unchanged.
 |---|---|---|
 | `OCI runtime exec failed: ... "claude-bridge": executable file not found in $PATH` | Bridge installed in a venv or `~/.local/bin` not on `docker exec`'s default `PATH` | Use the absolute path from `which claude-bridge` in the MCP config |
 | `dispatch` hangs or times out, but `list_channels` returns instantly | The bridge's cwd has a heavy `.claude/`. `claude -p` is loading project MCP servers/plugins and stalling | Anchor the bridge in a clean dir with `CLAUDE_BRIDGE_CWD`, pass `cwd=...` and bump `timeout_seconds` per call. See [Recommended pattern](#recommended-pattern) |
+| Cowork reports "lost the response handle" or hits a ~60s MCP ceiling on `dispatch` | The MCP transport caps individual tool calls; long claude runs exceed it | Use `dispatch_async` + `wait_dispatch`, not `dispatch`. Each `wait_dispatch` returns within 50s by design, and the underlying job survives across calls. See [Tools → Polling pattern](#polling-pattern-the-canonical-long-running-flow) |
+| A project MCP server (playwright, neon, cloudflare, …) disconnects mid-session and the channel keeps failing | The wedged MCP server is bound to the pinned `claude -p` session for that channel | `reset_channel("<name>")`, then dispatch again — the next `claude -p` reconnects all its project MCP servers from scratch |
 | Cowork doesn't see the server after editing the config | Window-close ≠ quit | Fully quit Claude Desktop and relaunch |
 | Edits to the config produce no servers and no error | JSON syntax error | `python -m json.tool < claude_desktop_config.json` to validate. Claude Desktop silently ignores malformed files |
 | `claude_desktop_config.json` `Settings → Connectors` UI doesn't list the bridge | That UI is for *remote* HTTP MCP servers only. Local stdio servers go in the JSON file | (Working as intended — you're not missing anything) |
@@ -194,12 +323,13 @@ its own.
 ## Security
 
 * The container is the trust boundary. Anyone who can `docker exec` into
-  it can drive `claude` with whatever auth lives there.
+  it can drive `claude` with whatever auth lives there. Same goes for
+  whoever can edit `claude_desktop_config.json` on the host.
 * `acceptEdits` (the default) auto-accepts file edits but still prompts
-  for `Bash` and other tools — fine for headless operation if the
-  prompt doesn't need shell. `bypassPermissions` only when the
-  container's network/filesystem isolation is doing the work; see the
-  [official devcontainer guide](https://code.claude.com/docs/en/devcontainer).
+  for `Bash`. Fine when the prompt doesn't need shell.
+* `bypassPermissions` removes all gates including the workspace sandbox
+  — only safe when the container's network/filesystem isolation is the
+  thing keeping you safe. See [Running unattended](#running-unattended-max-permissions).
 
 ## Development
 
