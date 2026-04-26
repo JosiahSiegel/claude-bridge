@@ -40,6 +40,15 @@ MCP):
   ``claude``. Override if it lives somewhere unusual.
 * ``CLAUDE_BRIDGE_DEFAULT_PERMISSION_MODE`` — default permission mode if the
   caller does not supply one. Default: ``acceptEdits``.
+* ``CLAUDE_BRIDGE_LOG`` — append-only JSONL event log. Default: disabled.
+  One line per state transition (``dispatch_start``, ``dispatch_end``,
+  ``dispatch_cancelled``, ``dispatch_error``, ``bridge_init_orphans``).
+  Set to a path the bridge user can write (e.g. ``/home/vscode/.claude-bridge/bridge.log``).
+* ``CLAUDE_BRIDGE_PERSIST_PROMPTS`` — ``1`` to include prompts in the
+  on-disk job records. Off by default; container is the trust boundary
+  but file dumps are easier to share than memory dumps.
+* ``CLAUDE_BRIDGE_LOG_PROMPTS`` — ``1`` to include prompts in the JSONL
+  log. Off by default for the same reason.
 """
 
 from __future__ import annotations
@@ -62,12 +71,19 @@ _CLAUDE_BIN = os.environ.get("CLAUDE_BRIDGE_CLAUDE_BIN", "claude")
 _DEFAULT_PERMISSION_MODE = os.environ.get(
     "CLAUDE_BRIDGE_DEFAULT_PERMISSION_MODE", "acceptEdits"
 )
+_LOG_PATH_ENV = os.environ.get("CLAUDE_BRIDGE_LOG")
+_LOG_PATH = Path(_LOG_PATH_ENV) if _LOG_PATH_ENV else None
+_PERSIST_PROMPTS = os.environ.get("CLAUDE_BRIDGE_PERSIST_PROMPTS") == "1"
+_LOG_PROMPTS = os.environ.get("CLAUDE_BRIDGE_LOG_PROMPTS") == "1"
 
 mcp: FastMCP = FastMCP("claude-bridge")
 dispatcher = Dispatcher(
     state_path=_STATE_PATH,
     claude_bin=_CLAUDE_BIN,
     default_cwd=_DEFAULT_CWD,
+    log_path=_LOG_PATH,
+    persist_prompts=_PERSIST_PROMPTS,
+    log_prompts=_LOG_PROMPTS,
 )
 
 

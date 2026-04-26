@@ -158,7 +158,9 @@ run in parallel; same-channel calls serialize.
 
 Returns `{ok, channel, duration_ms, result, session_id, raw}` on
 success, or `{ok: false, channel, duration_ms, error, exit_code}` on
-failure. **Failures never raise** — the MCP layer always sees a result.
+failure. Both shapes include `stderr` when claude wrote to it (e.g.
+project-MCP-server warnings). **Failures never raise** — the MCP layer
+always sees a result.
 
 ### Asynchronous (long-running)
 
@@ -177,11 +179,15 @@ Non-blocking status read. `status` is one of:
 
 * `running` — also includes `elapsed_ms` so you can show progress.
 * `done` — full sync-style result keys (`ok`, `result`, `session_id`,
-  `duration_ms`, `raw`, …) plus `job_id` and `started_at`.
+  `duration_ms`, `raw`, `stderr`, …) plus `job_id` and `started_at`.
 * `cancelled` — caller cancelled and the subprocess was killed.
 * `error` — programmer error in the dispatcher itself; should be rare.
+* `orphaned` — bridge process was restarted while the job was running;
+  result was not captured. The job's channel pinning is auto-reset so
+  the next dispatch on that channel starts fresh.
 
-Unknown `job_id` returns `{ok: false, error: ...}`.
+Unknown `job_id` returns `{ok: false, error: ...}`. Works for both live
+jobs and ones loaded from disk after a restart.
 
 #### `wait_dispatch(job_id, max_wait_seconds=50)`
 
@@ -237,14 +243,62 @@ while True:
 common case for real work; the loop just goes around again. When the
 job finishes, `wait_dispatch` returns immediately with the full result.
 
+## Durability guarantees (long workflows)
+
+The bridge is designed so Cowork can trust it across hours-long
+workflows that span Claude Desktop restarts, container/bridge process
+restarts, and Cowork's own MCP-transport quirks. The contract:
+
+* **Channel→session pinning persists** to `sessions.json` via atomic
+  temp+rename writes. A crash mid-write never corrupts it.
+* **Every job's state persists** to `jobs.json` (same directory) on
+  every transition: spawn, completion (success/failure), cancellation.
+  After a bridge restart, `get_dispatch(job_id)` still returns the
+  recorded result of any job that finished before the crash.
+* **In-flight jobs at restart are marked `orphaned`**, not dropped.
+  Callers see a definite terminal state instead of "unknown job_id".
+  The orphaned job's channel pinning is **auto-reset** so the next
+  dispatch on that channel starts a fresh session — avoiding races with
+  any stray `claude -p` still running in the container that's holding
+  the old session id.
+* **Concurrent persistence is serialized** through an `asyncio.Lock`
+  around the jobs-file write, so two parallel `dispatch_async` calls
+  can't lose each other's updates.
+* **Failures never raise out of the MCP layer.** Subprocess errors,
+  timeouts, missing binary, bad JSON, cancellation — all return a
+  structured `ok: false` result. The MCP transport always sees a clean
+  tool response.
+* **Cancellation kills the subprocess.** Calling `cancel_dispatch` on a
+  running job triggers a `CancelledError` handler that `kill()`s
+  `claude -p` before propagating, so cancellation never leaves an
+  orphan worker spending API credits.
+* **`wait_dispatch` is shielded.** If Cowork's MCP call to
+  `wait_dispatch` gets aborted at the transport ceiling, the underlying
+  job survives — Cowork just calls `wait_dispatch(job_id, ...)` again
+  with the same `job_id`.
+
+What this does **not** cover (and how to handle it):
+
+* **Orphan `claude -p` processes** after a crash. The bridge knows the
+  job is orphaned, but the actual subprocess might still be running in
+  the container (parented to PID 1). It will exit on its own, usually
+  in a few minutes. If you want to be aggressive: `pkill -f claude` in
+  the container after a known restart. The auto-channel-reset means
+  the next dispatch won't race it on the same session.
+* **Container death.** If the container itself dies, all subprocesses
+  die with it; nothing for the bridge to recover.
+
 ## Configuration (env vars in the container)
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `CLAUDE_BRIDGE_STATE` | `~/.claude-bridge/sessions.json` | Channel→session map (atomic writes) |
+| `CLAUDE_BRIDGE_STATE` | `~/.claude-bridge/sessions.json` | Channel→session map (atomic writes). Job records persist alongside in `jobs.json` in the same directory |
 | `CLAUDE_BRIDGE_CWD` | bridge process cwd | **Default** working dir for `claude -p`. Per-call `cwd=` overrides |
 | `CLAUDE_BRIDGE_CLAUDE_BIN` | `claude` | Override `claude` binary location |
 | `CLAUDE_BRIDGE_DEFAULT_PERMISSION_MODE` | `acceptEdits` | Default if caller omits `permission_mode` |
+| `CLAUDE_BRIDGE_LOG` | unset | If set to a path, writes one JSONL line per state transition (`dispatch_start`, `dispatch_end`, `dispatch_cancelled`, `dispatch_error`, `bridge_init_orphans`). Helps when something looks wrong at the bridge layer |
+| `CLAUDE_BRIDGE_PERSIST_PROMPTS` | unset | Set to `1` to include the prompt text in `jobs.json`. Off by default; opt in for post-mortem debugging |
+| `CLAUDE_BRIDGE_LOG_PROMPTS` | unset | Set to `1` to include prompts in the JSONL log too. Off by default |
 
 Set these via your MCP config (`docker exec -e KEY=value ...`) or your
 devcontainer's `containerEnv`. They are not negotiated over MCP.

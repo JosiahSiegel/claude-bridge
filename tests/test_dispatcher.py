@@ -12,11 +12,20 @@ These verify the load-bearing invariants:
 * The async dispatch surface (``dispatch_async`` / ``get_dispatch`` /
   ``wait_dispatch`` / ``cancel_dispatch``) returns immediately, lets the
   caller poll, kills subprocesses on cancel, and respects channel locks.
+* Job state is persisted to disk so a bridge process restart still lets
+  callers retrieve completed results, and in-flight jobs become
+  ``orphaned`` (with their channel pinning auto-reset to avoid races
+  with any orphan ``claude -p`` still running in the container).
+* Stderr is captured even on success so callers can see project-MCP
+  warnings.
+* The optional event log (``CLAUDE_BRIDGE_LOG``) records state
+  transitions and respects the prompt-redaction default.
 """
 
 from __future__ import annotations
 
 import asyncio
+import json
 import time
 from pathlib import Path
 
@@ -401,6 +410,250 @@ async def test_completed_jobs_evicted_when_over_cap(
     # The two most recent must survive; older ones evicted.
     assert job_ids[-1] in remaining
     assert job_ids[0] not in remaining
+
+
+# ---------- persistence / orphan handling / log / stderr ----------
+
+
+async def test_finished_job_survives_dispatcher_reconstruction(
+    fake_claude, state_path
+):
+    """A done job must still be retrievable after the bridge process
+    'restarts'. We simulate a restart by constructing a second Dispatcher
+    pointed at the same state path."""
+    d1 = Dispatcher(state_path=state_path, claude_bin=str(fake_claude))
+    job_id = await d1.dispatch_async("hi", channel="alpha")
+    final = await d1.wait_dispatch(job_id, max_wait_seconds=5)
+    assert final["status"] == "done"
+
+    # Tear down d1 (drop the live Task reference) and rebuild from disk.
+    del d1
+    d2 = Dispatcher(state_path=state_path, claude_bin=str(fake_claude))
+
+    reread = d2.get_dispatch(job_id)
+    assert reread["status"] == "done"
+    assert reread["ok"] is True
+    assert reread["result"] == "hi"
+    assert reread["job_id"] == job_id
+
+
+async def test_inflight_job_marked_orphaned_after_restart(
+    fake_claude, state_path, monkeypatch
+):
+    """If the bridge dies mid-dispatch, the next bridge must surface a
+    definite terminal state, not "unknown job_id"."""
+    monkeypatch.setenv("CLAUDE_FAKE_SLEEP", "5")
+    d1 = Dispatcher(state_path=state_path, claude_bin=str(fake_claude))
+    job_id = await d1.dispatch_async("hi", channel="alpha", timeout_seconds=30)
+    # Give the persistence write a moment to land before we 'crash'.
+    await asyncio.sleep(0.05)
+    assert d1.get_dispatch(job_id)["status"] == "running"
+
+    # Cancel the live task so we don't leak a fake-claude subprocess into
+    # the next test, then drop the dispatcher.
+    d1.cancel_dispatch(job_id)
+    await asyncio.sleep(0.05)
+    del d1
+
+    d2 = Dispatcher(state_path=state_path, claude_bin=str(fake_claude))
+    reread = d2.get_dispatch(job_id)
+    # The persisted record was either "cancelled" (cancel landed before
+    # restart) or "orphaned" (cancel didn't make it to disk in time).
+    # Both are acceptable terminal states; the contract is that the job
+    # is no longer "running" and the caller gets a definite answer.
+    assert reread["status"] in {"orphaned", "cancelled"}
+    assert reread["ok"] is False
+
+
+async def test_orphaned_job_resets_its_channel_pinning(
+    fake_claude, state_path
+):
+    """An orphaned in-flight job's channel must be auto-unpinned so a
+    fresh dispatch on that channel doesn't race with the orphan
+    subprocess by --resume'ing the same session id.
+
+    Simulating a real crash from inside the asyncio loop is awkward —
+    asyncio's shutdown machinery cancels everything cleanly, which is
+    the *opposite* of the case we care about. So we seed the persisted
+    files directly and verify the dispatcher does the right thing on
+    construction.
+    """
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    # Channel pinned to a session, as it would be after a successful prior
+    # dispatch.
+    state_path.write_text(
+        json.dumps({"channels": {"alpha": "session-from-prior-run"}}),
+        encoding="utf-8",
+    )
+    # And a "running" job from that crashed bridge.
+    (state_path.parent / "jobs.json").write_text(
+        json.dumps({
+            "jobs": [{
+                "id": "ghost-job",
+                "channel": "alpha",
+                "started_at": time.time() - 30,
+                "args": {"channel": "alpha", "permission_mode": "acceptEdits"},
+                "status": "running",
+                "finished_at": None,
+                "result": None,
+                "error": None,
+            }],
+        }),
+        encoding="utf-8",
+    )
+
+    d = Dispatcher(state_path=state_path, claude_bin=str(fake_claude))
+
+    # The orphaned job's channel pinning must be cleared.
+    assert "alpha" not in d.list_channels(), d.list_channels()
+
+    # The job itself is now a terminal "orphaned" record.
+    reread = d.get_dispatch("ghost-job")
+    assert reread["status"] == "orphaned"
+    assert reread["ok"] is False
+    assert "result was not captured" in reread["error"]
+
+    # And the orphan-marking is durable: a second restart sees the
+    # same final state, doesn't re-orphan, doesn't re-reset.
+    del d
+    d2 = Dispatcher(state_path=state_path, claude_bin=str(fake_claude))
+    assert d2.get_dispatch("ghost-job")["status"] == "orphaned"
+    assert "alpha" not in d2.list_channels()
+
+
+async def test_stderr_captured_on_success(fake_claude, state_path, monkeypatch):
+    """Project MCP server warnings often arrive on stderr while claude
+    still exits 0. Callers must be able to see them."""
+    monkeypatch.setenv("CLAUDE_FAKE_STDERR", "playwright-persona disconnected")
+    d = Dispatcher(state_path=state_path, claude_bin=str(fake_claude))
+    res = await d.dispatch("hi", channel="alpha")
+    assert res.ok is True
+    assert res.stderr == "playwright-persona disconnected"
+    payload = res.to_dict()
+    assert payload.get("stderr") == "playwright-persona disconnected"
+
+
+async def test_log_writes_jsonl_events(
+    fake_claude, state_path, tmp_path
+):
+    """Every state transition writes one JSONL line with at least an
+    event type, timestamp, and job_id."""
+    log_path = tmp_path / "bridge.log"
+    d = Dispatcher(
+        state_path=state_path,
+        claude_bin=str(fake_claude),
+        log_path=log_path,
+    )
+    job_id = await d.dispatch_async("hi", channel="alpha")
+    final = await d.wait_dispatch(job_id, max_wait_seconds=5)
+    assert final["status"] == "done"
+
+    lines = [
+        json.loads(line) for line in log_path.read_text().splitlines() if line.strip()
+    ]
+    events = [entry["event"] for entry in lines]
+    assert "dispatch_start" in events
+    assert "dispatch_end" in events
+    end_entry = [e for e in lines if e["event"] == "dispatch_end"][0]
+    assert end_entry["job_id"] == job_id
+    assert end_entry["channel"] == "alpha"
+    assert end_entry["ok"] is True
+
+
+async def test_log_redacts_prompt_by_default(
+    fake_claude, state_path, tmp_path
+):
+    log_path = tmp_path / "bridge.log"
+    d = Dispatcher(
+        state_path=state_path,
+        claude_bin=str(fake_claude),
+        log_path=log_path,
+    )
+    secret = "do not leak this prompt to the log"
+    job_id = await d.dispatch_async(secret, channel="alpha")
+    await d.wait_dispatch(job_id, max_wait_seconds=5)
+
+    contents = log_path.read_text()
+    assert secret not in contents, contents
+
+
+async def test_log_prompts_opt_in_includes_prompt(
+    fake_claude, state_path, tmp_path
+):
+    log_path = tmp_path / "bridge.log"
+    d = Dispatcher(
+        state_path=state_path,
+        claude_bin=str(fake_claude),
+        log_path=log_path,
+        log_prompts=True,
+    )
+    secret = "this prompt SHOULD appear in the log"
+    job_id = await d.dispatch_async(secret, channel="alpha")
+    await d.wait_dispatch(job_id, max_wait_seconds=5)
+
+    contents = log_path.read_text()
+    assert secret in contents
+
+
+async def test_persist_prompts_opt_in_writes_to_jobs_file(
+    fake_claude, state_path
+):
+    """With ``persist_prompts=True``, the prompt is durably stored on
+    disk so a post-mortem can see what was dispatched. Off by default."""
+    d = Dispatcher(
+        state_path=state_path,
+        claude_bin=str(fake_claude),
+        persist_prompts=True,
+    )
+    secret = "post-mortem prompt"
+    job_id = await d.dispatch_async(secret, channel="alpha")
+    await d.wait_dispatch(job_id, max_wait_seconds=5)
+
+    jobs_file = state_path.parent / "jobs.json"
+    persisted = json.loads(jobs_file.read_text())
+    [entry] = [j for j in persisted["jobs"] if j["id"] == job_id]
+    assert entry["args"]["prompt"] == secret
+
+
+async def test_persist_prompts_off_by_default(fake_claude, state_path):
+    d = Dispatcher(state_path=state_path, claude_bin=str(fake_claude))
+    secret = "this prompt should not be on disk"
+    job_id = await d.dispatch_async(secret, channel="alpha")
+    await d.wait_dispatch(job_id, max_wait_seconds=5)
+
+    jobs_file = state_path.parent / "jobs.json"
+    [entry] = [j for j in json.loads(jobs_file.read_text())["jobs"] if j["id"] == job_id]
+    assert "prompt" not in entry["args"]
+    # And the prompt isn't anywhere else in the file either.
+    assert secret not in jobs_file.read_text()
+
+
+async def test_corrupt_jobs_file_doesnt_crash_init(state_path, fake_claude):
+    """A garbled jobs.json must be tolerated so the bridge can keep
+    running on the channels we still know about."""
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    (state_path.parent / "jobs.json").write_text("{not valid json")
+    d = Dispatcher(state_path=state_path, claude_bin=str(fake_claude))
+    assert d.list_jobs() == []
+    # And a new dispatch still works.
+    job_id = await d.dispatch_async("hi", channel="alpha")
+    final = await d.wait_dispatch(job_id, max_wait_seconds=5)
+    assert final["status"] == "done"
+
+
+async def test_list_jobs_strips_raw_for_size(fake_claude, state_path):
+    """``list_jobs`` is called repeatedly for diagnostics; ``raw`` can
+    be multi-MB on real claude runs, so it's elided here. Full payload
+    is still available via ``get_dispatch``."""
+    d = Dispatcher(state_path=state_path, claude_bin=str(fake_claude))
+    job_id = await d.dispatch_async("hi", channel="alpha")
+    await d.wait_dispatch(job_id, max_wait_seconds=5)
+
+    [summary] = d.list_jobs()
+    assert summary["status"] == "done"
+    assert "raw" not in summary
+    full = d.get_dispatch(job_id)
+    assert "raw" in full
 
 
 async def test_concurrent_same_channel_serializes(
