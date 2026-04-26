@@ -177,14 +177,20 @@ Returns `{ok: true, job_id, channel}`.
 
 Non-blocking status read. `status` is one of:
 
-* `running` — also includes `elapsed_ms` so you can show progress.
+* `running` — work in flight; also includes `elapsed_ms` for progress.
 * `done` — full sync-style result keys (`ok`, `result`, `session_id`,
   `duration_ms`, `raw`, `stderr`, …) plus `job_id` and `started_at`.
-* `cancelled` — caller cancelled and the subprocess was killed.
-* `error` — programmer error in the dispatcher itself; should be rare.
-* `orphaned` — bridge process was restarted while the job was running;
-  result was not captured. The job's channel pinning is auto-reset so
-  the next dispatch on that channel starts fresh.
+* `cancelled` — `cancel_dispatch` was called by the user; subprocess
+  was SIGTERMed.
+* `abandoned` — the asyncio task running the dispatch was cancelled by
+  the runtime (transport timeout, FastMCP shutdown, loop teardown).
+  The subprocess kept running; a watcher will finalize it when it
+  exits, transitioning the status to `done` (or `error`). Poll again.
+* `error` — programmer error in the dispatcher itself, or output that
+  couldn't be parsed; should be rare.
+* `orphaned` — bridge restarted but the subprocess and output files
+  are gone; result was lost. The channel pinning is auto-reset so the
+  next dispatch starts fresh.
 
 Unknown `job_id` returns `{ok: false, error: ...}`. Works for both live
 jobs and ones loaded from disk after a restart.
@@ -247,46 +253,73 @@ job finishes, `wait_dispatch` returns immediately with the full result.
 
 The bridge is designed so Cowork can trust it across hours-long
 workflows that span Claude Desktop restarts, container/bridge process
-restarts, and Cowork's own MCP-transport quirks. The contract:
+restarts, MCP transport hiccups, and Cowork's own per-call timeouts.
+The contract:
 
-* **Channel→session pinning persists** to `sessions.json` via atomic
-  temp+rename writes. A crash mid-write never corrupts it.
-* **Every job's state persists** to `jobs.json` (same directory) on
-  every transition: spawn, completion (success/failure), cancellation.
-  After a bridge restart, `get_dispatch(job_id)` still returns the
-  recorded result of any job that finished before the crash.
-* **In-flight jobs at restart are marked `orphaned`**, not dropped.
-  Callers see a definite terminal state instead of "unknown job_id".
-  The orphaned job's channel pinning is **auto-reset** so the next
-  dispatch on that channel starts a fresh session — avoiding races with
-  any stray `claude -p` still running in the container that's holding
-  the old session id.
-* **Concurrent persistence is serialized** through an `asyncio.Lock`
-  around the jobs-file write, so two parallel `dispatch_async` calls
-  can't lose each other's updates.
-* **Failures never raise out of the MCP layer.** Subprocess errors,
-  timeouts, missing binary, bad JSON, cancellation — all return a
-  structured `ok: false` result. The MCP transport always sees a clean
-  tool response.
-* **Cancellation kills the subprocess.** Calling `cancel_dispatch` on a
-  running job triggers a `CancelledError` handler that `kill()`s
-  `claude -p` before propagating, so cancellation never leaves an
-  orphan worker spending API credits.
-* **`wait_dispatch` is shielded.** If Cowork's MCP call to
-  `wait_dispatch` gets aborted at the transport ceiling, the underlying
-  job survives — Cowork just calls `wait_dispatch(job_id, ...)` again
-  with the same `job_id`.
+### What persists
 
-What this does **not** cover (and how to handle it):
+* **Channel→session pinning** in `sessions.json`, atomic temp+rename
+  writes.
+* **Every job's state** in `jobs.json` (same directory) on every
+  transition: spawn (with PID and output-dir), completion, cancellation,
+  abandonment. Concurrent writes are serialized through an
+  `asyncio.Lock` so parallel dispatches can't lose each other's updates.
+* **Subprocess output** in `<state>.parent/job-output/<job_id>/{stdout,stderr}`,
+  written by `claude -p` directly (not via pipes the bridge has to
+  drain). Output survives bridge crashes and asyncio task cancellations.
 
-* **Orphan `claude -p` processes** after a crash. The bridge knows the
-  job is orphaned, but the actual subprocess might still be running in
-  the container (parented to PID 1). It will exit on its own, usually
-  in a few minutes. If you want to be aggressive: `pkill -f claude` in
-  the container after a known restart. The auto-channel-reset means
-  the next dispatch won't race it on the same session.
+### Subprocess lifetime is decoupled from the bridge
+
+For `dispatch_async`, the subprocess is spawned with
+`start_new_session=True` (its own session, immune to SIGHUP) and
+stdin redirected to `/dev/null`. Three follow-on guarantees:
+
+* **MCP transport timeouts can't kill the work.** If FastMCP cancels
+  the asyncio task running a dispatch (because Cowork's MCP request
+  hit a transport timeout, or the connection blipped), the subprocess
+  keeps running and writing output. The job is marked `abandoned`
+  rather than `cancelled`, and a watcher coroutine reaps it when it
+  finishes — finalizing the result from the on-disk output files.
+* **Bridge crashes don't kill the work.** If the bridge process dies
+  (OOM, supervisor restart, manual kill), the subprocess is parented
+  to PID 1 and keeps running. On bridge restart:
+  * If the PID is still alive, the job stays `running` and a watcher
+    is re-spawned.
+  * If the PID has exited and the output files are intact, the job is
+    finalized — `get_dispatch(job_id)` returns the recovered result.
+  * If neither, the job becomes `orphaned` and its channel is unpinned
+    so a new dispatch can't race a stray subprocess on the same session.
+* **`cancel_dispatch` is the only way to actually stop the work.** It
+  sets a `cancel_requested` flag, SIGTERMs the subprocess by PID
+  (then SIGKILLs if it's still alive on the watcher's next tick), and
+  cancels the asyncio task. Status becomes `cancelled`. Anything else
+  that ends a task (transport timeout, runtime cancellation, asyncio
+  loop teardown) becomes `abandoned`, not `cancelled`.
+
+### `wait_dispatch` is shielded
+
+If Cowork's MCP call to `wait_dispatch` is cancelled by the transport
+(e.g. exceeded the per-call ceiling), the underlying job survives —
+the inner task is wrapped in `asyncio.shield`. Cowork retries with the
+same `job_id` and gets the next slice of state.
+
+### Failures never raise out of the MCP layer
+
+Subprocess errors, timeouts, missing binary, malformed JSON, runtime
+cancellation — all become structured `ok: false` results. The MCP
+transport always sees a clean tool response.
+
+### What this does **not** cover
+
 * **Container death.** If the container itself dies, all subprocesses
-  die with it; nothing for the bridge to recover.
+  die with it. Nothing for the bridge to recover.
+* **Output-file corruption** (e.g. disk full). If `claude -p`'s stdout
+  is truncated, the recovery path treats it as a parse failure and
+  marks the job as `error`.
+* **Subprocess exit code on recovery.** When the bridge wasn't the
+  parent at exit, we can't read the return code. Recovery treats
+  well-formed JSON as success and unparseable output as failure — the
+  exit code is informative but not load-bearing.
 
 ## Configuration (env vars in the container)
 

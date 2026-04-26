@@ -641,6 +641,256 @@ async def test_corrupt_jobs_file_doesnt_crash_init(state_path, fake_claude):
     assert final["status"] == "done"
 
 
+async def test_async_dispatch_writes_subprocess_output_to_files(
+    fake_claude, state_path
+):
+    """The async path must redirect stdout/stderr to files under
+    ``job-output/<job_id>``, so output survives even if our asyncio task
+    is cancelled before reading the pipe."""
+    d = Dispatcher(state_path=state_path, claude_bin=str(fake_claude))
+    job_id = await d.dispatch_async("hi", channel="alpha")
+    final = await d.wait_dispatch(job_id, max_wait_seconds=5)
+    assert final["status"] == "done"
+
+    out_dir = state_path.parent / "job-output" / job_id
+    assert out_dir.is_dir()
+    stdout_text = (out_dir / "stdout").read_text()
+    # Fake-claude wrote a JSON line to stdout, which is what dispatch parsed.
+    assert "session_id" in stdout_text
+    assert (out_dir / "stderr").exists()
+
+
+async def test_subprocess_pid_persisted_to_jobs_file(
+    fake_claude, state_path, monkeypatch
+):
+    """During a dispatch, the PID is on disk *before* we await
+    completion. A bridge that crashes mid-dispatch can find the
+    subprocess by reading jobs.json."""
+    monkeypatch.setenv("CLAUDE_FAKE_SLEEP", "0.5")
+    d = Dispatcher(state_path=state_path, claude_bin=str(fake_claude))
+    job_id = await d.dispatch_async("hi", channel="alpha")
+
+    # PID and output_dir are persisted before claude exits.
+    await asyncio.sleep(0.1)
+    persisted = json.loads((state_path.parent / "jobs.json").read_text())
+    [entry] = [j for j in persisted["jobs"] if j["id"] == job_id]
+    assert entry["pid"] is not None and entry["pid"] > 0
+    assert entry["output_dir"]
+    assert Path(entry["output_dir"]).exists()
+
+    await d.wait_dispatch(job_id, max_wait_seconds=5)
+
+
+async def test_runtime_cancel_marks_abandoned_not_cancelled(
+    fake_claude, state_path, monkeypatch
+):
+    """If the asyncio task is cancelled by the runtime (not via
+    cancel_dispatch), the job becomes ``abandoned`` — leaving the
+    subprocess alive so a watcher can finalize the result."""
+    monkeypatch.setenv("CLAUDE_FAKE_SLEEP", "0.4")
+    d = Dispatcher(state_path=state_path, claude_bin=str(fake_claude))
+
+    job_id = await d.dispatch_async("hi", channel="alpha", timeout_seconds=10)
+    # Give it a beat to actually spawn the subprocess.
+    await asyncio.sleep(0.05)
+    job = d._jobs[job_id]
+    assert job.task is not None
+    # Cancel the task WITHOUT going through cancel_dispatch — simulates
+    # a runtime cancellation (FastMCP transport disconnect, loop teardown).
+    job.task.cancel()
+    # Let the cancellation handler write to disk.
+    with __import__("contextlib").suppress(BaseException):
+        await job.task
+
+    state = d.get_dispatch(job_id)
+    assert state["status"] == "abandoned", state
+    assert "transport disconnect" in state["error"] or "loop shutdown" in state["error"]
+    # The subprocess should still be running for a moment; the watcher
+    # will finalize it.
+    final = await asyncio.wait_for(
+        _wait_for_status(d, job_id, target_statuses={"done", "error"}),
+        timeout=3,
+    )
+    assert final["status"] in {"done", "error"}
+
+
+async def test_user_cancel_still_marks_cancelled(
+    fake_claude, state_path, monkeypatch
+):
+    """``cancel_dispatch`` keeps its old user-visible semantics:
+    status becomes ``cancelled``, not ``abandoned``."""
+    monkeypatch.setenv("CLAUDE_FAKE_SLEEP", "5")
+    d = Dispatcher(state_path=state_path, claude_bin=str(fake_claude))
+
+    job_id = await d.dispatch_async("hi", channel="alpha", timeout_seconds=30)
+    await asyncio.sleep(0.05)
+    cancel_res = d.cancel_dispatch(job_id)
+    assert cancel_res["cancelled"] is True
+
+    final = await d.wait_dispatch(job_id, max_wait_seconds=3)
+    assert final["status"] == "cancelled"
+
+
+async def _wait_for_status(d, job_id, target_statuses, poll=0.1, deadline=5.0):
+    """Tiny helper — polls get_dispatch until status enters the target set."""
+    end = time.monotonic() + deadline
+    while time.monotonic() < end:
+        state = d.get_dispatch(job_id)
+        if state["status"] in target_statuses:
+            return state
+        await asyncio.sleep(poll)
+    return d.get_dispatch(job_id)
+
+
+async def test_recovery_finalizes_completed_orphan(
+    fake_claude, state_path
+):
+    """Most important durability test: bridge dies after subprocess
+    finished. New bridge constructs, sees the persisted "running" job
+    with output files on disk, and finalizes from those files."""
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # Hand-craft an output dir with a successful claude JSON payload.
+    job_id = "ghost-finished"
+    out_dir = state_path.parent / "job-output" / job_id
+    out_dir.mkdir(parents=True, exist_ok=True)
+    (out_dir / "stdout").write_text(
+        json.dumps({
+            "result": "recovered after restart",
+            "session_id": "session-from-orphan",
+            "is_error": False,
+        })
+    )
+    (out_dir / "stderr").write_text("")
+
+    # Persist a "running" job pointing at a PID that doesn't exist (so
+    # _is_pid_alive returns False, triggering the dead-but-output-present
+    # finalization path).
+    (state_path.parent / "jobs.json").write_text(
+        json.dumps({
+            "jobs": [{
+                "id": job_id,
+                "channel": "alpha",
+                "started_at": time.time() - 30,
+                "args": {"channel": "alpha"},
+                "status": "running",
+                "finished_at": None,
+                "result": None,
+                "error": None,
+                "pid": 999_999_999,  # not a real pid
+                "output_dir": str(out_dir),
+            }],
+        })
+    )
+
+    d = Dispatcher(state_path=state_path, claude_bin=str(fake_claude))
+    state = d.get_dispatch(job_id)
+    assert state["status"] == "done", state
+    assert state["ok"] is True
+    assert state["result"] == "recovered after restart"
+    assert state["session_id"] == "session-from-orphan"
+
+
+async def test_recovery_keeps_alive_orphan_running_until_watcher_finalizes(
+    fake_claude, state_path
+):
+    """If a persisted job's PID is still alive at restart, the bridge
+    leaves it as ``running`` and (after ``ensure_watchers_running``)
+    the watcher reaps it when it exits."""
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    # We'll spawn a real long-running fake-claude as our 'orphan' so its
+    # PID is alive. Run it ourselves via subprocess.Popen so it survives
+    # this test's setup.
+    import subprocess
+    job_id = "ghost-alive"
+    out_dir = state_path.parent / "job-output" / job_id
+    out_dir.mkdir(parents=True, exist_ok=True)
+    stdout_path = out_dir / "stdout"
+    stderr_path = out_dir / "stderr"
+
+    env = {**__import__("os").environ, "CLAUDE_FAKE_SLEEP": "1"}
+    with stdout_path.open("wb") as so, stderr_path.open("wb") as se:
+        proc = subprocess.Popen(
+            [str(fake_claude), "-p", "hi"],
+            stdin=subprocess.DEVNULL,
+            stdout=so,
+            stderr=se,
+            env=env,
+            start_new_session=True,
+        )
+
+    try:
+        (state_path.parent / "jobs.json").write_text(
+            json.dumps({
+                "jobs": [{
+                    "id": job_id,
+                    "channel": "alpha",
+                    "started_at": time.time(),
+                    "args": {"channel": "alpha"},
+                    "status": "running",
+                    "finished_at": None,
+                    "result": None,
+                    "error": None,
+                    "pid": proc.pid,
+                    "output_dir": str(out_dir),
+                }],
+            })
+        )
+
+        d = Dispatcher(
+            state_path=state_path,
+            claude_bin=str(fake_claude),
+            _watcher_poll_seconds=0.1,
+        )
+        # Subprocess is alive; status is still "running" right after init.
+        assert d.get_dispatch(job_id)["status"] == "running"
+
+        # Bootstrap the watcher and let it reap the subprocess.
+        await d.ensure_watchers_running()
+        final = await asyncio.wait_for(
+            _wait_for_status(d, job_id, target_statuses={"done", "error"}),
+            timeout=5,
+        )
+        assert final["status"] == "done", final
+        assert final["ok"] is True
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait()
+
+
+async def test_recovery_marks_orphan_when_pid_and_output_missing(
+    fake_claude, state_path
+):
+    """If a persisted job has neither a live PID nor recoverable output,
+    we fall back to the tombstone behavior: orphaned + reset channel."""
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    state_path.write_text(
+        json.dumps({"channels": {"alpha": "session-from-prior-run"}})
+    )
+    (state_path.parent / "jobs.json").write_text(
+        json.dumps({
+            "jobs": [{
+                "id": "tombstone",
+                "channel": "alpha",
+                "started_at": time.time() - 10,
+                "args": {"channel": "alpha"},
+                "status": "running",
+                "finished_at": None,
+                "result": None,
+                "error": None,
+                "pid": None,
+                "output_dir": None,
+            }],
+        })
+    )
+
+    d = Dispatcher(state_path=state_path, claude_bin=str(fake_claude))
+    state = d.get_dispatch("tombstone")
+    assert state["status"] == "orphaned"
+    assert "alpha" not in d.list_channels()
+
+
 async def test_list_jobs_strips_raw_for_size(fake_claude, state_path):
     """``list_jobs`` is called repeatedly for diagnostics; ``raw`` can
     be multi-MB on real claude runs, so it's elided here. Full payload

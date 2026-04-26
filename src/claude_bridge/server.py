@@ -170,6 +170,7 @@ async def dispatch_async(
 
         {"ok": false, "error": "prompt is empty"}
     """
+    await dispatcher.ensure_watchers_running()
     try:
         job_id = await dispatcher.dispatch_async(
             prompt=prompt,
@@ -204,6 +205,7 @@ async def wait_dispatch(job_id: str, max_wait_seconds: int = 50) -> dict:
     underlying job is shielded from cancellation, so an aborted MCP call
     on this poller doesn't kill the work in flight.
     """
+    await dispatcher.ensure_watchers_running()
     return await dispatcher.wait_dispatch(job_id, max_wait_seconds)
 
 
