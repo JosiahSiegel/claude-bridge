@@ -1,0 +1,15 @@
+{
+  "_comment_1": "Merge the mcpServers entry below into Claude Desktop's claude_desktop_config.json. Open it via Claude Desktop → Settings → Developer → Edit Config, or edit directly: macOS ~/Library/Application Support/Claude/, Windows %APPDATA%\\Claude\\, Linux ~/.config/Claude/.",
+  "_comment_2": "REPLACE BOTH PLACEHOLDERS: '<container>' is what `docker ps` shows in the NAMES column. '/absolute/path/to/claude-bridge' is what `which claude-bridge` prints from INSIDE the container — typical values: /usr/local/bin/claude-bridge (system pip), /home/<user>/.local/bin/claude-bridge (pipx), <repo>/.venv/bin/claude-bridge (editable venv install).",
+  "_comment_3": "Use the absolute path. `docker exec` does NOT activate venvs or source ~/.bashrc; the bare 'claude-bridge' name only works if the binary lives in a directory baked into the image's default PATH. After saving, fully quit and relaunch Claude Desktop — Cowork inherits servers from this file; there is no separate Cowork-only registration for local stdio.",
+  "mcpServers": {
+    "devcontainer-claude": {
+      "command": "docker",
+      "args": [
+        "exec", "-i",
+        "<container>",
+        "/absolute/path/to/claude-bridge"
+      ]
+    }
+  }
+}
