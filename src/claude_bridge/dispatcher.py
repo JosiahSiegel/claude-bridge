@@ -68,6 +68,7 @@ import contextlib
 import datetime as _dt
 import json
 import signal
+import urllib.request
 import os
 import time
 import uuid
@@ -141,8 +142,12 @@ class Schedule:
     last_job_id: str | None = None
     last_tick_status: str | None = None
     tick_count: int = 0
-    status: str = "active"  # active | completed | cancelled | error
+    status: str = "active"  # waiting | active | completed | cancelled | error
     error: str | None = None
+    after_schedule_id: str | None = None
+    notify_url: str | None = None
+    notify_on: list[str] = field(default_factory=list)
+    notify_headers: dict[str, str] = field(default_factory=dict)
 
     def to_persistable(self) -> dict[str, Any]:
         return {
@@ -159,6 +164,10 @@ class Schedule:
             "tick_count": self.tick_count,
             "status": self.status,
             "error": self.error,
+            "after_schedule_id": self.after_schedule_id,
+            "notify_url": self.notify_url,
+            "notify_on": list(self.notify_on),
+            "notify_headers": dict(self.notify_headers),
         }
 
     @classmethod
@@ -177,6 +186,10 @@ class Schedule:
             tick_count=int(data.get("tick_count") or 0),
             status=str(data.get("status") or "active"),
             error=data.get("error"),
+            after_schedule_id=data.get("after_schedule_id"),
+            notify_url=data.get("notify_url"),
+            notify_on=list(data.get("notify_on") or []),
+            notify_headers=dict(data.get("notify_headers") or {}),
         )
 
     def public_view(self) -> dict[str, Any]:
@@ -205,6 +218,9 @@ class Job:
     error: str | None = None
     pid: int | None = None
     output_dir: str | None = None
+    notify_url: str | None = None
+    notify_on: list[str] = field(default_factory=list)
+    notify_headers: dict[str, str] = field(default_factory=dict)
     task: "asyncio.Task[DispatchResult] | None" = field(default=None, repr=False)
     cancel_requested: bool = field(default=False, repr=False)
 
@@ -220,6 +236,9 @@ class Job:
             "error": self.error,
             "pid": self.pid,
             "output_dir": self.output_dir,
+            "notify_url": self.notify_url,
+            "notify_on": list(self.notify_on),
+            "notify_headers": dict(self.notify_headers),
         }
 
     @classmethod
@@ -235,6 +254,9 @@ class Job:
             error=data.get("error"),
             pid=data.get("pid"),
             output_dir=data.get("output_dir"),
+            notify_url=data.get("notify_url"),
+            notify_on=list(data.get("notify_on") or []),
+            notify_headers=dict(data.get("notify_headers") or {}),
             task=None,
         )
 
@@ -248,6 +270,7 @@ class Dispatcher:
     log_path: Path | None = None
     persist_prompts: bool = False
     log_prompts: bool = False
+    max_events: int = 1000
     _watcher_poll_seconds: float = field(default=2.0, repr=False)
     _scheduler_poll_seconds: float = field(default=5.0, repr=False)
     _min_schedule_interval_seconds: float = field(default=10.0, repr=False)
@@ -262,6 +285,7 @@ class Dispatcher:
     _schedules_save_lock: asyncio.Lock = field(
         default_factory=asyncio.Lock, init=False, repr=False
     )
+    _events: list[dict[str, Any]] = field(default_factory=list, init=False, repr=False)
     _state: dict[str, Any] = field(default_factory=dict, init=False)
     _jobs: dict[str, Job] = field(default_factory=dict, init=False)
     _jobs_save_lock: asyncio.Lock = field(
@@ -273,6 +297,7 @@ class Dispatcher:
         self._jobs = self._load_jobs()
         self._mark_orphans_on_startup()
         self._schedules = self._load_schedules()
+        self._events = self._load_events()
 
     # ----- state persistence -----
 
@@ -494,27 +519,215 @@ class Dispatcher:
         async with self._schedules_save_lock:
             self._save_schedules_sync()
 
-    # ----- structured logging -----
+    # ----- structured event log -----
+    #
+    # Two surfaces:
+    #
+    # 1. The optional file log at ``log_path`` (set via
+    #    ``CLAUDE_BRIDGE_LOG``) — append-only JSONL, the durable record
+    #    for ops/post-mortem.
+    # 2. The in-memory ring buffer ``_events`` plus its disk mirror at
+    #    ``events.json`` — bounded, queryable via ``list_events``,
+    #    persisted across bridge restarts. This is the surface Cowork
+    #    uses for "what happened while I was offline?".
+    #
+    # Both are populated from the single ``_log_event`` call site, so a
+    # new event type added anywhere flows to both surfaces automatically.
+
+    @property
+    def _events_path(self) -> Path:
+        return self.state_path.parent / "events.json"
+
+    def _load_events(self) -> list[dict[str, Any]]:
+        path = self._events_path
+        if not path.exists():
+            return []
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return []
+        raw = data.get("events", [])
+        if not isinstance(raw, list):
+            return []
+        return list(raw)[-self.max_events :]
+
+    def _save_events_sync(self) -> None:
+        path = self._events_path
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        payload = {"events": self._events}
+        tmp.write_text(json.dumps(payload, default=str), encoding="utf-8")
+        os.replace(tmp, path)
 
     def _log_event(self, event: str, **fields: Any) -> None:
-        """Append one JSONL event to ``log_path`` if configured.
+        """Append a structured event. Hits the in-memory buffer plus the
+        on-disk JSON mirror, plus the optional ``log_path`` JSONL file.
 
-        Failures are swallowed so a broken log path never takes down a
-        dispatch. Prompts are excluded by default; opt in via
-        ``log_prompts=True`` (or ``CLAUDE_BRIDGE_LOG_PROMPTS=1``).
+        Failures on either persistence path are swallowed so a broken
+        log path never takes down a dispatch. Prompts are excluded by
+        default; opt in via ``log_prompts=True`` (or
+        ``CLAUDE_BRIDGE_LOG_PROMPTS=1``).
         """
+        record: dict[str, Any] = {
+            "ts": time.time(),
+            "event": event,
+            **fields,
+        }
+        # In-memory buffer + persisted mirror (always on; bounded).
+        self._events.append(record)
+        if len(self._events) > self.max_events:
+            self._events = self._events[-self.max_events :]
+        try:
+            self._save_events_sync()
+        except OSError:
+            pass
+
+        # Optional human-readable JSONL file.
         if self.log_path is None:
             return
         try:
             self.log_path.parent.mkdir(parents=True, exist_ok=True)
-            line = json.dumps(
-                {"ts": time.time(), "event": event, **fields},
-                default=str,
-            )
+            line = json.dumps(record, default=str)
             with open(self.log_path, "a", encoding="utf-8") as f:
                 f.write(line + "\n")
         except OSError:
             pass
+
+    def list_events(
+        self,
+        since: float = 0.0,
+        limit: int = 100,
+        types: list[str] | None = None,
+    ) -> list[dict[str, Any]]:
+        """Return events whose ``ts > since``, oldest first, capped at
+        ``limit``. Optional ``types`` filters by event name."""
+        out: list[dict[str, Any]] = []
+        types_set = set(types) if types else None
+        for record in self._events:
+            ts = record.get("ts")
+            if not isinstance(ts, (int, float)) or ts <= since:
+                continue
+            if types_set is not None and record.get("event") not in types_set:
+                continue
+            out.append(record)
+            if limit > 0 and len(out) >= limit:
+                break
+        return out
+
+    # ----- outbound webhooks (best-effort push) -----
+    #
+    # Both Job and Schedule support optional ``notify_url`` /
+    # ``notify_on`` / ``notify_headers``. When a hooked event fires we
+    # POST a small JSON payload to ``notify_url`` and log the outcome
+    # (``webhook_sent`` / ``webhook_failed``) to the event log.
+    #
+    # Delivery is fire-and-log: no retries, no queueing, no caller
+    # propagation. The bridge is intentionally not a delivery system.
+    # The destination is expected to be a small relay the user owns
+    # (e.g. an HTTP endpoint that forwards to Slack/Pushover/email or
+    # injects a chat message). All real durability — "did the user
+    # actually see it?" — lives in that relay.
+
+    _WEBHOOK_MAX_RESULT_CHARS = 4096
+    _WEBHOOK_TIMEOUT_SECONDS = 10.0
+
+    @staticmethod
+    def _truncate_for_webhook(s: str | None) -> str | None:
+        if s is None:
+            return None
+        if len(s) <= Dispatcher._WEBHOOK_MAX_RESULT_CHARS:
+            return s
+        cap = Dispatcher._WEBHOOK_MAX_RESULT_CHARS
+        return s[:cap] + f"…[truncated, original {len(s)} chars]"
+
+    async def _send_webhook(
+        self, url: str, headers: dict[str, str] | None, payload: dict[str, Any]
+    ) -> None:
+        """Fire-and-log POST. Errors are swallowed and logged as
+        ``webhook_failed``; never propagated to the caller."""
+        body = json.dumps(payload, default=str).encode("utf-8")
+        req_headers = {
+            "Content-Type": "application/json",
+            "User-Agent": "claude-bridge/0.1",
+            **(headers or {}),
+        }
+        req = urllib.request.Request(
+            url, data=body, headers=req_headers, method="POST"
+        )
+
+        def _send() -> int:
+            with urllib.request.urlopen(
+                req, timeout=self._WEBHOOK_TIMEOUT_SECONDS
+            ) as resp:
+                return int(resp.status)
+
+        loop = asyncio.get_running_loop()
+        event = payload.get("event")
+        try:
+            status = await loop.run_in_executor(None, _send)
+            self._log_event(
+                "webhook_sent", url=url, payload_event=event, http_status=status
+            )
+        except Exception as exc:  # noqa: BLE001
+            self._log_event(
+                "webhook_failed",
+                url=url,
+                payload_event=event,
+                error=f"{type(exc).__name__}: {exc}",
+            )
+
+    async def _maybe_notify_job(self, job: Job, event: str) -> None:
+        """If the job opted into webhooks for this event, send it."""
+        if not job.notify_url:
+            return
+        configured = job.notify_on or ["done"]
+        if event not in configured:
+            return
+        result_preview = None
+        ok = None
+        if job.result is not None:
+            ok = job.result.get("ok")
+            result_preview = self._truncate_for_webhook(
+                str(job.result.get("result") or "")
+            )
+        payload = {
+            "event": event,
+            "job_id": job.id,
+            "channel": job.channel,
+            "status": job.status,
+            "started_at": job.started_at,
+            "finished_at": job.finished_at,
+            "ok": ok,
+            "result_preview": result_preview,
+            "error": job.error,
+        }
+        await self._send_webhook(job.notify_url, job.notify_headers, payload)
+
+    async def _maybe_notify_schedule(
+        self,
+        schedule: Schedule,
+        event: str,
+        last_tick_result: str | None = None,
+    ) -> None:
+        if not schedule.notify_url:
+            return
+        configured = schedule.notify_on or ["schedule_end"]
+        if event not in configured:
+            return
+        payload = {
+            "event": event,
+            "schedule_id": schedule.id,
+            "channel": schedule.channel,
+            "tick_count": schedule.tick_count,
+            "status": schedule.status,
+            "last_tick_at": schedule.last_tick_at,
+            "last_tick_result": self._truncate_for_webhook(last_tick_result),
+            "last_job_id": schedule.last_job_id,
+            "error": schedule.error,
+        }
+        await self._send_webhook(
+            schedule.notify_url, schedule.notify_headers, payload
+        )
 
     # ----- channel ops -----
 
@@ -985,6 +1198,28 @@ class Dispatcher:
         now = time.time()
         # Iterate a snapshot — schedules can be added/cancelled mid-loop.
         for schedule in list(self._schedules.values()):
+            # Promote waiting → active when predecessor terminates.
+            if schedule.status == "waiting":
+                pred_id = schedule.after_schedule_id
+                pred = self._schedules.get(pred_id) if pred_id else None
+                if pred is None or pred.status in (
+                    "completed",
+                    "cancelled",
+                    "error",
+                ):
+                    schedule.status = "active"
+                    await self._save_schedules()
+                    self._log_event(
+                        "schedule_activated",
+                        schedule_id=schedule.id,
+                        channel=schedule.channel,
+                        after_schedule_id=pred_id,
+                        predecessor_status=(pred.status if pred else "missing"),
+                    )
+                else:
+                    # Predecessor still running; nothing else to do this round.
+                    continue
+
             if schedule.status != "active":
                 continue
 
@@ -1008,6 +1243,16 @@ class Dispatcher:
                             schedule_id=schedule.id,
                             tick_count=schedule.tick_count,
                         )
+                        await self._maybe_notify_schedule(
+                            schedule,
+                            "tick_with_sentinel",
+                            last_tick_result=last_text,
+                        )
+                        await self._maybe_notify_schedule(
+                            schedule,
+                            "schedule_end",
+                            last_tick_result=last_text,
+                        )
                         continue
 
             # 2. Past the until?
@@ -1019,6 +1264,10 @@ class Dispatcher:
                     schedule_id=schedule.id,
                     tick_count=schedule.tick_count,
                     reason="until_reached",
+                )
+                last_text = self._last_tick_result_text(schedule)
+                await self._maybe_notify_schedule(
+                    schedule, "schedule_end", last_tick_result=last_text
                 )
                 continue
 
@@ -1059,6 +1308,8 @@ class Dispatcher:
                     schedule_id=schedule.id,
                     error=schedule.error,
                 )
+                await self._maybe_notify_schedule(schedule, "tick_error")
+                await self._maybe_notify_schedule(schedule, "schedule_end")
                 continue
             schedule.last_tick_at = now
             schedule.last_job_id = job_id
@@ -1071,6 +1322,15 @@ class Dispatcher:
                 job_id=job_id,
                 tick_count=schedule.tick_count,
             )
+            await self._maybe_notify_schedule(schedule, "tick")
+
+    def _last_tick_result_text(self, schedule: Schedule) -> str | None:
+        if not schedule.last_job_id:
+            return None
+        job = self._jobs.get(schedule.last_job_id)
+        if job is None or job.result is None:
+            return None
+        return str(job.result.get("result") or "")
 
     async def create_schedule(
         self,
@@ -1082,12 +1342,24 @@ class Dispatcher:
         timeout_seconds: int = 300,
         permission_mode: str = "acceptEdits",
         cwd: str | None = None,
+        after_schedule_id: str | None = None,
+        notify_url: str | None = None,
+        notify_on: list[str] | None = None,
+        notify_headers: dict[str, str] | None = None,
     ) -> dict[str, Any]:
         """Create a recurring dispatch.
 
         Returns either ``{"ok": True, "schedule_id": ..., "schedule": ...}``
         or ``{"ok": False, "error": ...}`` for validation failures.
         Does not raise — same fail-soft contract as ``dispatch``.
+
+        ``after_schedule_id`` chains schedules: this one stays in
+        ``waiting`` status until the named predecessor reaches a
+        terminal state (completed, cancelled, or error). The chain is
+        validated for existence and cycles.
+
+        ``notify_url`` opts the schedule into webhook notifications;
+        see ``_maybe_notify_schedule``.
         """
         if not prompt.strip():
             return {"ok": False, "error": "prompt is empty"}
@@ -1124,6 +1396,36 @@ class Dispatcher:
                 return {"ok": False, "error": "until_seconds must be positive"}
             until_epoch = time.time() + float(until_seconds)
 
+        # Validate chain.
+        initial_status = "active"
+        if after_schedule_id is not None:
+            predecessor = self._schedules.get(after_schedule_id)
+            if predecessor is None:
+                return {
+                    "ok": False,
+                    "error": f"unknown after_schedule_id: {after_schedule_id}",
+                }
+            # Cycle detection — walk the chain and ensure we don't loop.
+            seen: set[str] = set()
+            cur: str | None = after_schedule_id
+            while cur is not None:
+                if cur in seen:
+                    return {
+                        "ok": False,
+                        "error": (
+                            f"after_schedule_id chain has a cycle "
+                            f"involving {cur}"
+                        ),
+                    }
+                seen.add(cur)
+                step = self._schedules.get(cur)
+                cur = step.after_schedule_id if step else None
+            # If predecessor already terminal, start active immediately.
+            if predecessor.status in ("completed", "cancelled", "error"):
+                initial_status = "active"
+            else:
+                initial_status = "waiting"
+
         schedule = Schedule(
             id=str(uuid.uuid4()),
             prompt=prompt,
@@ -1136,6 +1438,11 @@ class Dispatcher:
                 "cwd": cwd,
             },
             created_at=time.time(),
+            status=initial_status,
+            after_schedule_id=after_schedule_id,
+            notify_url=notify_url,
+            notify_on=list(notify_on or []),
+            notify_headers=dict(notify_headers or {}),
         )
         self._schedules[schedule.id] = schedule
         await self._save_schedules()
@@ -1145,6 +1452,8 @@ class Dispatcher:
             channel=channel,
             interval_seconds=interval_seconds,
             until=until_epoch,
+            after_schedule_id=after_schedule_id,
+            initial_status=initial_status,
         )
         return {"ok": True, "schedule_id": schedule.id, "schedule": schedule.public_view()}
 
@@ -1174,7 +1483,7 @@ class Dispatcher:
         sched = self._schedules.get(schedule_id)
         if sched is None:
             return {"ok": False, "error": f"unknown schedule_id: {schedule_id}"}
-        if sched.status != "active":
+        if sched.status not in ("active", "waiting"):
             return {
                 "ok": True,
                 "cancelled": False,
@@ -1187,6 +1496,10 @@ class Dispatcher:
             "schedule_cancelled",
             schedule_id=schedule_id,
             tick_count=sched.tick_count,
+        )
+        last_text = self._last_tick_result_text(sched)
+        await self._maybe_notify_schedule(
+            sched, "schedule_end", last_tick_result=last_text
         )
         return {"ok": True, "cancelled": True, "schedule": sched.public_view()}
 
@@ -1264,12 +1577,19 @@ class Dispatcher:
         timeout_seconds: int = 300,
         permission_mode: str = "acceptEdits",
         cwd: str | None = None,
+        notify_url: str | None = None,
+        notify_on: list[str] | None = None,
+        notify_headers: dict[str, str] | None = None,
     ) -> str:
         """Kick off ``dispatch`` in the background; return a ``job_id``.
 
         Use this when the round trip might exceed the MCP transport's
         per-call ceiling (~60s). Channel locking still applies — concurrent
         async dispatches on the same channel queue up.
+
+        Optional ``notify_url`` triggers a webhook POST when the job
+        reaches a terminal state matching ``notify_on`` (default
+        ``["done"]``; see ``_maybe_notify_job`` for the payload shape).
 
         Empty prompts raise ``ValueError`` here rather than scheduling a
         task that immediately errors out, so callers see the failure
@@ -1293,6 +1613,9 @@ class Dispatcher:
             started_at=time.time(),
             args=args,
             status="running",
+            notify_url=notify_url,
+            notify_on=list(notify_on or []),
+            notify_headers=dict(notify_headers or {}),
         )
         self._jobs[job_id] = job
         await self._save_jobs()
@@ -1366,6 +1689,7 @@ class Dispatcher:
                 self._spawn_watcher(job)
             job.finished_at = time.time()
             await self._save_jobs()
+            await self._maybe_notify_job(job, job.status)
             raise
         except Exception as exc:
             job.status = "error"
@@ -1378,6 +1702,7 @@ class Dispatcher:
                 channel=job.channel,
                 error=job.error,
             )
+            await self._maybe_notify_job(job, "error")
             raise
 
         job.status = "done"
@@ -1392,6 +1717,7 @@ class Dispatcher:
             duration_ms=result.duration_ms,
             exit_code=result.exit_code,
         )
+        await self._maybe_notify_job(job, "done")
         return result
 
     def _live_status(self, job: Job) -> dict[str, Any]:

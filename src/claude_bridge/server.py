@@ -219,13 +219,17 @@ def bridge_help() -> dict:
                 "summary": (
                     "Recurring dispatch on a channel at an interval. "
                     "Each tick is its own dispatch_async job — "
-                    "individually short, collectively long-running."
+                    "individually short, collectively long-running. "
+                    "Supports chaining (after_schedule_id) and webhooks "
+                    "(notify_url)."
                 ),
                 "when_to_use": (
                     "Watch-this-condition-over-time work that doesn't "
                     "fit in a single long dispatch: 'every 5 min for the "
                     "next 4 hours, check open PRs and merge anything "
-                    "ready.' The bridge owns the loop; you walk away."
+                    "ready.' The bridge owns the loop; you walk away. "
+                    "For pipelines (do A, then do B once A finishes), "
+                    "pass after_schedule_id."
                 ),
                 "when_not_to_use": (
                     "One-shot work — use dispatch or dispatch_async. "
@@ -285,6 +289,26 @@ def bridge_help() -> dict:
                     "asynchronously."
                 ),
                 "when_not_to_use": "If you know the specific job_id, wait_dispatch is more direct.",
+            },
+            "list_events": {
+                "group": "event_log",
+                "summary": (
+                    "Bridge-wide structured event stream with cursor "
+                    "pagination. Records dispatch lifecycle, schedule "
+                    "ticks, sentinel hits, recovery actions."
+                ),
+                "when_to_use": (
+                    "Top of every turn: 'what happened while I was "
+                    "offline?' — one call gets you every notable "
+                    "event since your cursor, including events from "
+                    "schedules whose ticks completed without you "
+                    "watching them. Cheaper than scanning "
+                    "list_completions for sentinels."
+                ),
+                "when_not_to_use": (
+                    "If you only care about job results (no schedule "
+                    "context), list_completions is cheaper."
+                ),
             },
             "list_channels": {
                 "group": "channels",
@@ -360,6 +384,48 @@ def bridge_help() -> dict:
                 ],
                 "example": "wait_any_completion(since=1714000000.0, max_wait_seconds=2)",
             },
+            {
+                "name": "What happened while I was offline? (event log)",
+                "steps": [
+                    "events = list_events(since=last_seen_ts)",
+                    "# Filter to surfacing-worthy events:",
+                    "# types=['schedule_self_cancelled', 'schedule_completed', 'dispatch_end']",
+                    "for e in events: handle e by event_type",
+                    "last_seen_ts = max(e['ts'] for e in events) if events else last_seen_ts",
+                ],
+                "example": (
+                    "list_events(since=last_seen_ts, "
+                    "types=['schedule_self_cancelled', "
+                    "'schedule_completed'])"
+                ),
+            },
+            {
+                "name": "Pipeline: do B after A finishes",
+                "steps": [
+                    "a = schedule_dispatch(prompt='wave A …', channel='wave-a', interval_seconds=300, until_seconds=14400)",
+                    "b = schedule_dispatch(prompt='wave B …', channel='wave-b', interval_seconds=600, until_seconds=3600, after_schedule_id=a['schedule_id'])",
+                    "# B sits in 'waiting' until A completes / cancels / errors, then activates automatically.",
+                ],
+                "example": (
+                    "schedule_dispatch(prompt='post-merge hygiene', "
+                    "channel='hygiene', interval_seconds=600, "
+                    "until_seconds=3600, after_schedule_id=<wave_a_id>)"
+                ),
+            },
+            {
+                "name": "Push: relay to chat / phone via webhook",
+                "steps": [
+                    "schedule_dispatch(... , notify_url='https://your-relay/notify', notify_on=['schedule_end'])",
+                    "# When the schedule terminates, the bridge POSTs:",
+                    "#   {event, schedule_id, channel, tick_count, status, last_tick_result, ...}",
+                    "# Your relay forwards to Slack / Pushover / email / chat injection.",
+                ],
+                "example": (
+                    "dispatch_async(prompt='long task', channel='x', "
+                    "notify_url='https://relay.example.com/cowork-push', "
+                    "notify_headers={'X-Auth': 'abc'})"
+                ),
+            },
         ],
         "concepts": {
             "channel": (
@@ -369,6 +435,30 @@ def bridge_help() -> dict:
                 "subsequent dispatches on the same channel resume it. "
                 "Distinct channels run in parallel; same-channel calls "
                 "serialize."
+            ),
+            "schedule_chaining": (
+                "schedule_dispatch accepts after_schedule_id to gate "
+                "activation on a predecessor's terminal state. The "
+                "successor stays in 'waiting' until the predecessor "
+                "completes / cancels / errors, then transitions to "
+                "'active' on the next scheduler tick. Cycles are "
+                "rejected at creation."
+            ),
+            "webhooks": (
+                "dispatch_async and schedule_dispatch accept notify_url "
+                "+ notify_on + notify_headers. The bridge POSTs a JSON "
+                "payload at matching state transitions. Delivery is "
+                "fire-and-log — the bridge does not retry. The destination "
+                "is your relay (Slack/Pushover/email/chat-injection); "
+                "real delivery durability lives there. Failures appear "
+                "in the event log as webhook_failed events."
+            ),
+            "event_log": (
+                "Every state transition (dispatch_*, schedule_*, "
+                "bridge_init_*, webhook_*) is recorded in a bounded "
+                "in-memory ring buffer (default 1000 events) with a "
+                "disk mirror at events.json. Query via list_events with "
+                "a since cursor."
             ),
             "session_pinning": (
                 "channel → session_id mapping is persisted to disk "
@@ -515,6 +605,9 @@ async def dispatch_async(
     timeout_seconds: int = 300,
     permission_mode: str | None = None,
     cwd: str | None = None,
+    notify_url: str | None = None,
+    notify_on: list[str] | None = None,
+    notify_headers: dict[str, str] | None = None,
 ) -> dict:
     """Spawn a dispatch in the background, return a ``job_id`` immediately.
 
@@ -530,6 +623,20 @@ async def dispatch_async(
     Args mirror ``dispatch``. Empty prompts return a structured error
     synchronously without creating a job.
 
+    Optional webhook notification (``notify_url``):
+      The bridge POSTs a JSON payload to ``notify_url`` when the job
+      reaches a terminal state matching ``notify_on``. ``notify_on``
+      values: ``done``, ``error``, ``cancelled``, ``abandoned``.
+      Default ``["done"]``. Delivery is fire-and-log — failures are
+      recorded in the event log as ``webhook_failed`` but don't affect
+      the job. Add auth via ``notify_headers``.
+
+    Payload shape (truncated to 4KB on ``result_preview``)::
+
+        {"event": "done", "job_id": "...", "channel": "...",
+         "status": "done", "ok": true, "started_at": ...,
+         "finished_at": ..., "result_preview": "...", "error": null}
+
     Returns:
         Success: ``{ok: true, job_id, channel}``.
         Validation failure: ``{ok: false, error}``.
@@ -542,6 +649,9 @@ async def dispatch_async(
             timeout_seconds=timeout_seconds,
             permission_mode=permission_mode or _DEFAULT_PERMISSION_MODE,
             cwd=cwd,
+            notify_url=notify_url,
+            notify_on=notify_on,
+            notify_headers=notify_headers,
         )
     except ValueError as exc:
         return {"ok": False, "error": str(exc)}
@@ -618,6 +728,10 @@ async def schedule_dispatch(
     timeout_seconds: int = 300,
     permission_mode: str | None = None,
     cwd: str | None = None,
+    after_schedule_id: str | None = None,
+    notify_url: str | None = None,
+    notify_on: list[str] | None = None,
+    notify_headers: dict[str, str] | None = None,
 ) -> dict:
     """Recurring dispatch: fire ``prompt`` on ``channel`` every
     ``interval_seconds``, until a deadline or until the prompt emits
@@ -641,6 +755,24 @@ async def schedule_dispatch(
         timeout_seconds: Per-tick timeout. Default 300.
         permission_mode: Same as ``dispatch``.
         cwd: Same as ``dispatch``.
+        after_schedule_id: Chain this schedule to start only after the
+            named predecessor terminates (completed, cancelled, or
+            error). Useful for pipelines: "after wave A merges, run
+            hygiene check wave B." This schedule starts in ``waiting``
+            status and transitions to ``active`` automatically. Cycles
+            are detected and rejected.
+        notify_url: HTTPS endpoint to POST event payloads to. Optional.
+            Bridge fires fire-and-log POSTs; the destination is the
+            user's relay (Slack/Pushover/email/etc.) — bridge does not
+            retry.
+        notify_on: List of event names to push. Values:
+            ``tick`` (every tick fired — chatty),
+            ``tick_with_sentinel`` (the tick that triggered self-cancel),
+            ``tick_error`` (a tick failed to spawn),
+            ``schedule_end`` (any terminal transition: completed,
+            cancelled, error). Default ``["schedule_end"]``.
+        notify_headers: Extra request headers (e.g. auth). Sent on
+            every webhook POST.
 
     Returns:
         ``{ok: true, schedule_id, schedule}`` or ``{ok: false, error}``.
@@ -651,6 +783,13 @@ async def schedule_dispatch(
 
         "Check open PRs. If all merged, end your reply with
         [BRIDGE_STOP_SCHEDULE]. Otherwise summarize."
+
+    Webhook payload shape (``result_preview`` truncated to 4KB)::
+
+        {"event": "schedule_end", "schedule_id": "...",
+         "channel": "...", "tick_count": 17, "status": "cancelled",
+         "last_tick_at": ..., "last_tick_result": "...",
+         "last_job_id": "...", "error": null}
     """
     await dispatcher.ensure_watchers_running()
     return await dispatcher.create_schedule(
@@ -662,6 +801,10 @@ async def schedule_dispatch(
         timeout_seconds=timeout_seconds,
         permission_mode=permission_mode or _DEFAULT_PERMISSION_MODE,
         cwd=cwd,
+        after_schedule_id=after_schedule_id,
+        notify_url=notify_url,
+        notify_on=notify_on,
+        notify_headers=notify_headers,
     )
 
 
@@ -721,6 +864,45 @@ async def wait_any_completion(
         since=since, max_wait_seconds=max_wait_seconds
     )
     return {"completions": comps}
+
+
+@mcp.tool()
+def list_events(
+    since: float = 0.0,
+    limit: int = 100,
+    types: list[str] | None = None,
+) -> dict:
+    """Return notable bridge events whose ``ts > since``, oldest first.
+
+    The event log is the right tool for "what happened while I was
+    offline?" — it records dispatch starts/ends, schedule ticks,
+    sentinel hits, schedule completions, and recovery actions. The
+    buffer is bounded (default 1000 events) and persisted across bridge
+    restarts.
+
+    Cursor pattern: pass ``since=0`` for everything, then on each
+    subsequent call pass the largest ``ts`` you saw. The buffer is
+    oldest-first, so pagination is straightforward.
+
+    Common ``types`` to filter by:
+
+    * Dispatch lifecycle: ``dispatch_start``, ``dispatch_end``,
+      ``dispatch_cancelled``, ``dispatch_abandoned``, ``dispatch_error``,
+      ``dispatch_orphan_finalized``.
+    * Schedule lifecycle: ``schedule_created``, ``schedule_tick``,
+      ``schedule_self_cancelled``, ``schedule_cancelled``,
+      ``schedule_completed``, ``schedule_tick_error``.
+    * Recovery: ``bridge_init_recovery``, ``bridge_init_subprocess_alive``.
+
+    Each event has ``ts`` (epoch seconds), ``event`` (type), plus
+    type-specific fields (``job_id``, ``schedule_id``, ``channel``,
+    ``ok``, ``duration_ms``, etc.).
+    """
+    return {
+        "events": dispatcher.list_events(
+            since=since, limit=limit, types=types
+        )
+    }
 
 
 # ---------- channel admin ----------

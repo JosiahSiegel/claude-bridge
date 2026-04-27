@@ -40,13 +40,25 @@ def test_bridge_help_lists_every_advertised_tool():
 def test_bridge_help_includes_workflows_and_concepts():
     help_doc = server.bridge_help()
     workflow_names = {w["name"] for w in help_doc["workflows"]}
-    # The four canonical patterns we want every agent to know about.
+    # Each named pattern is one we want every agent to recognize.
     assert any("Short prompt" in n for n in workflow_names)
     assert any("Long prompt" in n for n in workflow_names)
     assert any("Watch" in n or "recurring" in n.lower() for n in workflow_names)
     assert any("completions" in n.lower() or "turn" in n.lower() for n in workflow_names)
+    assert any("offline" in n.lower() or "event log" in n.lower() for n in workflow_names)
+    assert any("Pipeline" in n or "after" in n.lower() for n in workflow_names)
+    assert any("Push" in n or "webhook" in n.lower() for n in workflow_names)
     # Concepts cover the load-bearing ones.
-    for k in ("channel", "session_pinning", "permission_mode", "cwd", "stop_sentinel"):
+    for k in (
+        "channel",
+        "session_pinning",
+        "permission_mode",
+        "cwd",
+        "stop_sentinel",
+        "schedule_chaining",
+        "webhooks",
+        "event_log",
+    ):
         assert k in help_doc["concepts"], f"missing concept: {k}"
 
 

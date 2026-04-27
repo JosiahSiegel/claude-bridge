@@ -1161,6 +1161,405 @@ async def test_wait_any_completion_returns_empty_on_timeout(
     assert comps == []
 
 
+# ---------- bridge-owned event log + cursor ----------
+
+
+async def test_log_event_recorded_in_memory_buffer(
+    fake_claude, state_path
+):
+    d = Dispatcher(state_path=state_path, claude_bin=str(fake_claude))
+    job_id = await d.dispatch_async("hi", channel="alpha")
+    await d.wait_dispatch(job_id, max_wait_seconds=5)
+
+    events = d.list_events()
+    types = [e["event"] for e in events]
+    assert "dispatch_start" in types
+    assert "dispatch_end" in types
+    end = next(e for e in events if e["event"] == "dispatch_end")
+    assert end["job_id"] == job_id
+    assert end["channel"] == "alpha"
+    assert end["ok"] is True
+
+
+async def test_list_events_filters_by_since(
+    fake_claude, state_path
+):
+    d = Dispatcher(state_path=state_path, claude_bin=str(fake_claude))
+    job_id = await d.dispatch_async("first", channel="alpha")
+    await d.wait_dispatch(job_id, max_wait_seconds=5)
+    cursor = max(e["ts"] for e in d.list_events())
+
+    job2 = await d.dispatch_async("second", channel="beta")
+    await d.wait_dispatch(job2, max_wait_seconds=5)
+
+    new_events = d.list_events(since=cursor)
+    new_job_ids = {e.get("job_id") for e in new_events if "job_id" in e}
+    assert job_id not in new_job_ids
+    assert job2 in new_job_ids
+
+
+async def test_list_events_filters_by_types(
+    fake_claude, state_path
+):
+    d = Dispatcher(state_path=state_path, claude_bin=str(fake_claude))
+    job_id = await d.dispatch_async("hi", channel="alpha")
+    await d.wait_dispatch(job_id, max_wait_seconds=5)
+
+    starts_only = d.list_events(types=["dispatch_start"])
+    assert all(e["event"] == "dispatch_start" for e in starts_only)
+    assert len(starts_only) == 1
+
+
+async def test_events_persist_across_reconstruction(
+    fake_claude, state_path
+):
+    d1 = Dispatcher(state_path=state_path, claude_bin=str(fake_claude))
+    job_id = await d1.dispatch_async("hi", channel="alpha")
+    await d1.wait_dispatch(job_id, max_wait_seconds=5)
+    pre_count = len(d1.list_events())
+    del d1
+
+    d2 = Dispatcher(state_path=state_path, claude_bin=str(fake_claude))
+    post_events = d2.list_events()
+    assert len(post_events) >= pre_count
+    types = [e["event"] for e in post_events]
+    assert "dispatch_end" in types
+
+
+async def test_events_bounded_by_max_events(state_path, fake_claude):
+    d = Dispatcher(
+        state_path=state_path, claude_bin=str(fake_claude), max_events=5
+    )
+    for _ in range(20):
+        d._log_event("synthetic")
+    events = d.list_events()
+    assert len(events) == 5
+
+
+async def test_list_events_oldest_first(fake_claude, state_path):
+    d = Dispatcher(state_path=state_path, claude_bin=str(fake_claude))
+    d._log_event("a")
+    await asyncio.sleep(0.01)
+    d._log_event("b")
+    events = d.list_events()
+    a_idx = next(i for i, e in enumerate(events) if e["event"] == "a")
+    b_idx = next(i for i, e in enumerate(events) if e["event"] == "b")
+    assert a_idx < b_idx
+
+
+# ---------- webhook notifications ----------
+
+
+async def test_dispatch_webhook_fired_on_done(fake_claude, state_path):
+    """A finished job whose notify_url is set must POST a JSON payload
+    with event=done."""
+    received: list[dict] = []
+    url = await _start_capture_server(received)
+
+    d = Dispatcher(state_path=state_path, claude_bin=str(fake_claude))
+    job_id = await d.dispatch_async(
+        prompt="hi",
+        channel="alpha",
+        notify_url=url,
+    )
+    await d.wait_dispatch(job_id, max_wait_seconds=5)
+
+    # Webhook is fired in a background executor — give it a tick.
+    for _ in range(50):
+        if received:
+            break
+        await asyncio.sleep(0.05)
+
+    assert received, "expected one webhook delivery"
+    payload = received[0]
+    assert payload["event"] == "done"
+    assert payload["job_id"] == job_id
+    assert payload["channel"] == "alpha"
+    assert payload["ok"] is True
+
+
+async def test_dispatch_webhook_respects_notify_on(fake_claude, state_path):
+    """notify_on=['error'] must NOT fire on a successful done."""
+    received: list[dict] = []
+    url = await _start_capture_server(received)
+
+    d = Dispatcher(state_path=state_path, claude_bin=str(fake_claude))
+    job_id = await d.dispatch_async(
+        prompt="hi",
+        channel="alpha",
+        notify_url=url,
+        notify_on=["error"],
+    )
+    await d.wait_dispatch(job_id, max_wait_seconds=5)
+    await asyncio.sleep(0.3)
+    assert received == []
+
+
+async def test_dispatch_webhook_failure_is_swallowed(
+    fake_claude, state_path
+):
+    """If the destination is unreachable, the dispatch succeeds and the
+    failure is recorded in the event log — never propagated."""
+    d = Dispatcher(state_path=state_path, claude_bin=str(fake_claude))
+    job_id = await d.dispatch_async(
+        prompt="hi",
+        channel="alpha",
+        notify_url="http://127.0.0.1:1/never-listening",
+    )
+    final = await d.wait_dispatch(job_id, max_wait_seconds=5)
+    assert final["status"] == "done"
+    # Give the background webhook attempt a beat to fail.
+    for _ in range(40):
+        events = d.list_events(types=["webhook_failed"])
+        if events:
+            break
+        await asyncio.sleep(0.05)
+    assert d.list_events(types=["webhook_failed"]), (
+        "expected a webhook_failed event in the log"
+    )
+
+
+async def test_schedule_webhook_fired_on_schedule_end(
+    fake_claude, state_path, monkeypatch
+):
+    """When a schedule self-cancels via the stop sentinel, schedule_end
+    fires (the default notify_on)."""
+    monkeypatch.setenv("CLAUDE_FAKE_RESULT", f"done {STOP_SENTINEL}")
+    received: list[dict] = []
+    url = await _start_capture_server(received)
+
+    d = Dispatcher(
+        state_path=state_path,
+        claude_bin=str(fake_claude),
+        _scheduler_poll_seconds=0.05,
+        _min_schedule_interval_seconds=0.0,
+    )
+    res = await d.create_schedule(
+        prompt="hi",
+        channel="watcher",
+        interval_seconds=0.1,
+        notify_url=url,
+    )
+    schedule_id = res["schedule_id"]
+    await d.ensure_watchers_running()
+
+    # Wait for the sentinel to land + schedule_end webhook.
+    for _ in range(60):
+        if any(p["event"] == "schedule_end" for p in received):
+            break
+        await asyncio.sleep(0.05)
+
+    end_payload = next(
+        (p for p in received if p["event"] == "schedule_end"), None
+    )
+    assert end_payload is not None, received
+    assert end_payload["schedule_id"] == schedule_id
+    assert STOP_SENTINEL in (end_payload["last_tick_result"] or "")
+    assert end_payload["status"] == "cancelled"
+
+
+async def test_schedule_webhook_tick_with_sentinel_event(
+    fake_claude, state_path, monkeypatch
+):
+    """Opt into ``tick_with_sentinel`` and you receive both that AND
+    schedule_end (since the sentinel always implies a terminal transition)."""
+    monkeypatch.setenv("CLAUDE_FAKE_RESULT", f"done {STOP_SENTINEL}")
+    received: list[dict] = []
+    url = await _start_capture_server(received)
+
+    d = Dispatcher(
+        state_path=state_path,
+        claude_bin=str(fake_claude),
+        _scheduler_poll_seconds=0.05,
+        _min_schedule_interval_seconds=0.0,
+    )
+    await d.create_schedule(
+        prompt="hi",
+        channel="watcher",
+        interval_seconds=0.1,
+        notify_url=url,
+        notify_on=["tick_with_sentinel", "schedule_end"],
+    )
+    await d.ensure_watchers_running()
+
+    for _ in range(60):
+        events = {p["event"] for p in received}
+        if {"tick_with_sentinel", "schedule_end"} <= events:
+            break
+        await asyncio.sleep(0.05)
+
+    types = [p["event"] for p in received]
+    assert "tick_with_sentinel" in types
+    assert "schedule_end" in types
+
+
+# ---------- schedule chaining ----------
+
+
+async def test_chained_schedule_starts_in_waiting(
+    fake_claude, state_path
+):
+    d = Dispatcher(
+        state_path=state_path,
+        claude_bin=str(fake_claude),
+        _min_schedule_interval_seconds=0.0,
+    )
+    pred = await d.create_schedule(
+        prompt="a", channel="alpha", interval_seconds=60
+    )
+    succ = await d.create_schedule(
+        prompt="b",
+        channel="beta",
+        interval_seconds=60,
+        after_schedule_id=pred["schedule_id"],
+    )
+    assert succ["ok"] is True
+    sched = succ["schedule"]
+    assert sched["status"] == "waiting"
+    assert sched["after_schedule_id"] == pred["schedule_id"]
+
+
+async def test_chained_schedule_activates_when_predecessor_cancels(
+    fake_claude, state_path
+):
+    d = Dispatcher(
+        state_path=state_path,
+        claude_bin=str(fake_claude),
+        _scheduler_poll_seconds=0.05,
+        _min_schedule_interval_seconds=0.0,
+    )
+    pred = await d.create_schedule(
+        prompt="a", channel="alpha", interval_seconds=60
+    )
+    succ = await d.create_schedule(
+        prompt="b",
+        channel="beta",
+        interval_seconds=0.5,
+        after_schedule_id=pred["schedule_id"],
+    )
+    succ_id = succ["schedule_id"]
+    await d.ensure_watchers_running()
+
+    # Predecessor still active → successor stays waiting.
+    await asyncio.sleep(0.3)
+    assert d.get_schedule(succ_id)["schedule"]["status"] == "waiting"
+
+    await d.cancel_schedule(pred["schedule_id"])
+    # Successor should activate within a poll cycle and start firing.
+    for _ in range(40):
+        sched = d.get_schedule(succ_id)["schedule"]
+        if sched["status"] == "active":
+            break
+        await asyncio.sleep(0.05)
+    sched = d.get_schedule(succ_id)["schedule"]
+    assert sched["status"] == "active", sched
+    await d.cancel_schedule(succ_id)
+
+
+async def test_chained_schedule_activates_immediately_when_pred_already_terminal(
+    fake_claude, state_path
+):
+    d = Dispatcher(
+        state_path=state_path,
+        claude_bin=str(fake_claude),
+        _min_schedule_interval_seconds=0.0,
+    )
+    pred = await d.create_schedule(
+        prompt="a", channel="alpha", interval_seconds=60
+    )
+    await d.cancel_schedule(pred["schedule_id"])
+
+    succ = await d.create_schedule(
+        prompt="b",
+        channel="beta",
+        interval_seconds=60,
+        after_schedule_id=pred["schedule_id"],
+    )
+    assert succ["schedule"]["status"] == "active"
+
+
+async def test_chained_schedule_unknown_predecessor_rejected(
+    fake_claude, state_path
+):
+    d = Dispatcher(
+        state_path=state_path,
+        claude_bin=str(fake_claude),
+        _min_schedule_interval_seconds=0.0,
+    )
+    res = await d.create_schedule(
+        prompt="b",
+        channel="beta",
+        interval_seconds=60,
+        after_schedule_id="not-real",
+    )
+    assert res["ok"] is False
+    assert "unknown after_schedule_id" in res["error"]
+
+
+async def test_chained_schedule_cycle_rejected(
+    fake_claude, state_path
+):
+    """A → B, then B → A should be rejected at creation time."""
+    d = Dispatcher(
+        state_path=state_path,
+        claude_bin=str(fake_claude),
+        _min_schedule_interval_seconds=0.0,
+    )
+    a = await d.create_schedule(
+        prompt="a", channel="alpha", interval_seconds=60
+    )
+    b = await d.create_schedule(
+        prompt="b",
+        channel="beta",
+        interval_seconds=60,
+        after_schedule_id=a["schedule_id"],
+    )
+    # Now try to point A.after = B → cycle through B→A→B.
+    # We can't mutate via create, but we can attempt to create C that
+    # depends on A while A's chain is healthy. Real cycle detection
+    # only matters at creation; our scheduler can't introduce one.
+    # Force a cycle by hand-editing the in-memory chain to simulate
+    # a corrupt persisted file.
+    d._schedules[a["schedule_id"]].after_schedule_id = b["schedule_id"]
+    res = await d.create_schedule(
+        prompt="c",
+        channel="gamma",
+        interval_seconds=60,
+        after_schedule_id=b["schedule_id"],  # b → a → b
+    )
+    assert res["ok"] is False
+    assert "cycle" in res["error"].lower()
+
+
+# ---------- helpers ----------
+
+
+async def _start_capture_server(received: list[dict]):
+    """Spin up a tiny HTTP server that captures the first POST body
+    and returns it as a base URL. Caller can pass it as notify_url."""
+    import http.server
+    import threading
+
+    class _Handler(http.server.BaseHTTPRequestHandler):
+        def do_POST(self):  # noqa: N802
+            length = int(self.headers.get("Content-Length", "0"))
+            body = self.rfile.read(length).decode("utf-8")
+            try:
+                received.append(json.loads(body))
+            except json.JSONDecodeError:
+                received.append({"_raw": body})
+            self.send_response(204)
+            self.end_headers()
+
+        def log_message(self, format, *args):  # noqa: A002 — match base signature
+            return
+
+    server = http.server.HTTPServer(("127.0.0.1", 0), _Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    port = server.server_address[1]
+    return f"http://127.0.0.1:{port}/"
+
+
 # ---------- discoverability / bridge_help ----------
 
 

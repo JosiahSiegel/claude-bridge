@@ -159,18 +159,22 @@ recommended firewall config.
 > each, the four canonical workflows, and the gotchas that have
 > actually bitten users. Faster than skimming this section.
 
-The tool surface comes in five groups:
+The tool surface comes in six groups:
 
-* **Discovery**: `bridge_help`
+* **Discovery**: `bridge_help`.
 * **Synchronous**: `dispatch` — short prompts under the MCP ceiling.
 * **Asynchronous**: `dispatch_async` + `wait_dispatch` /
   `get_dispatch` / `cancel_dispatch` / `list_jobs` — anything longer.
+  Optional webhook on terminal state.
 * **Recurring**: `schedule_dispatch` + `list_schedules` /
   `get_schedule` / `cancel_schedule` — fire a prompt every N seconds
   on a channel until a deadline or the prompt emits the stop sentinel.
+  Supports chaining (`after_schedule_id`) and webhooks (`notify_url`).
+* **Event log**: `list_events` — cursor-paged stream of every notable
+  state transition. The "what happened while I was offline?" answer.
 * **Completion polling**: `list_completions`, `wait_any_completion`
-  — answer "anything new since I last looked?" without polling
-  individual `job_id`s.
+  — answer "anything new since I last looked?" for *finished jobs*.
+  Use `list_events` instead when you need schedule context.
 * **Channel admin**: `list_channels`, `reset_channel`.
 
 ### Synchronous
@@ -197,12 +201,21 @@ always sees a result.
 
 ### Asynchronous (long-running)
 
-#### `dispatch_async(prompt, channel="default", timeout_seconds=300, permission_mode=None, cwd=None)`
+#### `dispatch_async(prompt, channel="default", timeout_seconds=300, permission_mode=None, cwd=None, notify_url=None, notify_on=None, notify_headers=None)`
 
 Kick off a dispatch in the background; return a `job_id` immediately.
 Channel locking still applies — concurrent `dispatch_async` on the same
 channel queue up. Empty prompts surface as `{"ok": false, "error": ...}`
 synchronously (no orphan job).
+
+Optional webhook on terminal state: pass `notify_url` to have the
+bridge POST a JSON payload when the job ends. `notify_on` selects
+which terminal states notify (values: `done`, `error`, `cancelled`,
+`abandoned`; default `["done"]`). `notify_headers` adds auth.
+Delivery is fire-and-log; failures are recorded as `webhook_failed`
+events. Payload shape: `{event, job_id, channel, status, started_at,
+finished_at, ok, result_preview, error}` (`result_preview` is
+truncated to 4KB).
 
 Returns `{ok: true, job_id, channel}`.
 
@@ -251,7 +264,7 @@ and recently finished). Job retention is bounded by `max_completed_jobs`
 
 ### Recurring (long-running watch patterns)
 
-#### `schedule_dispatch(prompt, channel, interval_seconds, until=None, until_seconds=None, ...)`
+#### `schedule_dispatch(prompt, channel, interval_seconds, until=None, until_seconds=None, after_schedule_id=None, notify_url=None, notify_on=None, notify_headers=None, ...)`
 
 Fires `prompt` on `channel` every `interval_seconds`, until a deadline
 or until the prompt emits the literal stop sentinel
@@ -275,10 +288,55 @@ fires on the first iteration after a long gap).
   schedule_dispatch(prompt, channel="pr-watcher", interval_seconds=300, until_seconds=14400)
   ```
 
+* **Pipelines** — pass `after_schedule_id` to chain schedules. The new
+  schedule starts in `waiting` and transitions to `active` when the
+  predecessor reaches a terminal state (completed, cancelled, or
+  error). Cycles are detected and rejected at creation:
+
+  ```
+  a = schedule_dispatch(prompt="wave A merge…",  channel="wave-a", interval_seconds=300, until_seconds=14400)
+  b = schedule_dispatch(prompt="post-merge hygiene", channel="hygiene",
+                         interval_seconds=600, until_seconds=3600,
+                         after_schedule_id=a["schedule_id"])
+  ```
+
+* **Webhooks** — pass `notify_url` to get a JSON POST when the
+  schedule reaches notable transitions. `notify_on` selects events:
+  `tick`, `tick_with_sentinel`, `tick_error`, `schedule_end` (default
+  `["schedule_end"]`). `notify_headers` adds auth. Delivery is
+  fire-and-log; failures are logged as `webhook_failed` events.
+  Payload includes `event`, `schedule_id`, `channel`, `tick_count`,
+  `status`, `last_tick_result` (truncated to 4KB), `last_job_id`.
+
 #### `list_schedules() / get_schedule(id) / cancel_schedule(id)`
 
-Inspect or stop schedules. `cancel_schedule` does not cancel the
-in-flight tick — use `cancel_dispatch(last_job_id)` for that.
+Inspect or stop schedules. `cancel_schedule` fires the `schedule_end`
+webhook (if configured) and does not cancel the in-flight tick — use
+`cancel_dispatch(last_job_id)` for that.
+
+### Event log (turn-level "what happened while I was offline?")
+
+#### `list_events(since=0, limit=100, types=None)`
+
+Bridge-wide structured event stream. Records every notable transition:
+`dispatch_start`, `dispatch_end`, `dispatch_cancelled`,
+`dispatch_abandoned`, `dispatch_error`, `dispatch_orphan_finalized`,
+`schedule_created`, `schedule_tick`, `schedule_self_cancelled`,
+`schedule_cancelled`, `schedule_completed`, `schedule_activated`,
+`webhook_sent`, `webhook_failed`, `bridge_init_recovery`. The buffer is
+bounded (default 1000) and persisted to `events.json` so it survives
+restarts.
+
+Cursor pattern: pass `since=0` for everything, then track the largest
+`ts` you've seen. Optional `types` filters by event name. Returns
+oldest-first.
+
+```
+events = list_events(since=last_seen_ts,
+                     types=["schedule_self_cancelled", "schedule_completed", "dispatch_end"])
+for e in events: surface(e)
+last_seen_ts = max(e["ts"] for e in events) if events else last_seen_ts
+```
 
 ### Completion polling (turn-level "anything new?")
 
