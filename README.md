@@ -70,8 +70,28 @@ job = dispatch_async(
 # Then poll wait_dispatch(job["job_id"], max_wait_seconds=50) in a loop.
 ```
 
+For watch-this-condition-over-hours work, use `schedule_dispatch` —
+each tick is its own short job, the bridge owns the cron loop, and
+the prompt can self-cancel by emitting `[BRIDGE_STOP_SCHEDULE]`.
+
+```
+schedule_dispatch(
+  prompt="gh pr list --state open. If all merged, end with [BRIDGE_STOP_SCHEDULE]. Otherwise summarize.",
+  channel="pr-watcher",
+  interval_seconds=300,
+  until_seconds=14400,        # stop trying after 4 hours
+  permission_mode="bypassPermissions"
+)
+```
+
 See [Tools → Polling pattern](#polling-pattern-the-canonical-long-running-flow)
-for the full pattern.
+for the long-job loop and [Recurring](#recurring-long-running-watch-patterns)
+for schedules.
+
+**For agents using the bridge programmatically**: call `bridge_help()`
+first. It returns a structured guide to every tool, the four canonical
+workflows, and the gotchas. Designed to be the single discoverability
+entry point so agents don't have to skim the README.
 
 ## Recommended pattern
 
@@ -134,11 +154,24 @@ recommended firewall config.
 
 ## Tools
 
-The tool surface comes in two halves. Use the synchronous `dispatch`
-when the round trip will fit comfortably under the MCP transport's
-per-call ceiling (~60s in Cowork). Use the async surface for anything
-longer — persona runs, multi-step refactors, work in a project with
-heavy `.claude/` config.
+> **For agents reading this**: call `bridge_help()` once at the start
+> of a session. It returns a structured map of every tool, when to use
+> each, the four canonical workflows, and the gotchas that have
+> actually bitten users. Faster than skimming this section.
+
+The tool surface comes in five groups:
+
+* **Discovery**: `bridge_help`
+* **Synchronous**: `dispatch` — short prompts under the MCP ceiling.
+* **Asynchronous**: `dispatch_async` + `wait_dispatch` /
+  `get_dispatch` / `cancel_dispatch` / `list_jobs` — anything longer.
+* **Recurring**: `schedule_dispatch` + `list_schedules` /
+  `get_schedule` / `cancel_schedule` — fire a prompt every N seconds
+  on a channel until a deadline or the prompt emits the stop sentinel.
+* **Completion polling**: `list_completions`, `wait_any_completion`
+  — answer "anything new since I last looked?" without polling
+  individual `job_id`s.
+* **Channel admin**: `list_channels`, `reset_channel`.
 
 ### Synchronous
 
@@ -215,6 +248,52 @@ requested, `{cancelled: false, reason: "already_finished"}` otherwise.
 Diagnostics only — returns one summary dict per tracked job (running
 and recently finished). Job retention is bounded by `max_completed_jobs`
 (default 1000), so this is safe to call on a long-lived bridge.
+
+### Recurring (long-running watch patterns)
+
+#### `schedule_dispatch(prompt, channel, interval_seconds, until=None, until_seconds=None, ...)`
+
+Fires `prompt` on `channel` every `interval_seconds`, until a deadline
+or until the prompt emits the literal stop sentinel
+`[BRIDGE_STOP_SCHEDULE]` in its result. Each tick is its own
+`dispatch_async` job — short individually, collectively long-running.
+The bridge owns the loop, persists schedules to disk, and resumes them
+after a restart **without burst-firing** missed ticks (only one tick
+fires on the first iteration after a long gap).
+
+* `interval_seconds` minimum is 10s.
+* `until` is ISO 8601 (`"2026-04-27T20:00:00Z"`); `until_seconds` is
+  relative seconds-from-now. Mutually exclusive.
+* If a tick is still running when the next interval fires, the bridge
+  skips that tick (no stacking). Schedules use the same channel for
+  every tick, so ticks share session continuity.
+* Self-cancellation: have the prompt end with `[BRIDGE_STOP_SCHEDULE]`
+  when the watched condition resolves. Example:
+
+  ```
+  prompt = "gh pr list --state open. If all merged, end with [BRIDGE_STOP_SCHEDULE]. Otherwise summarize."
+  schedule_dispatch(prompt, channel="pr-watcher", interval_seconds=300, until_seconds=14400)
+  ```
+
+#### `list_schedules() / get_schedule(id) / cancel_schedule(id)`
+
+Inspect or stop schedules. `cancel_schedule` does not cancel the
+in-flight tick — use `cancel_dispatch(last_job_id)` for that.
+
+### Completion polling (turn-level "anything new?")
+
+#### `list_completions(since=0, limit=50)`
+
+Jobs whose `finished_at > since`, oldest first. Use `since=0` for
+"everything that ever finished". For ongoing polling, track the
+largest `finished_at` you've seen and pass it as the next `since`.
+Cheap, non-blocking — safe at the top of every turn.
+
+#### `wait_any_completion(since=0, max_wait_seconds=50)`
+
+Long-poll up to `max_wait_seconds` for any new completion since the
+cursor. Same MCP-ceiling-aware default as `wait_dispatch`. Returns
+immediately if any are already available.
 
 ### Channel admin
 
@@ -325,7 +404,7 @@ transport always sees a clean tool response.
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `CLAUDE_BRIDGE_STATE` | `~/.claude-bridge/sessions.json` | Channel→session map (atomic writes). Job records persist alongside in `jobs.json` in the same directory |
+| `CLAUDE_BRIDGE_STATE` | `~/.claude-bridge/sessions.json` | Channel→session map (atomic writes). The same directory holds `jobs.json`, `schedules.json`, `job-output/<job_id>/{stdout,stderr}` and (if enabled) the JSONL log |
 | `CLAUDE_BRIDGE_CWD` | bridge process cwd | **Default** working dir for `claude -p`. Per-call `cwd=` overrides |
 | `CLAUDE_BRIDGE_CLAUDE_BIN` | `claude` | Override `claude` binary location |
 | `CLAUDE_BRIDGE_DEFAULT_PERMISSION_MODE` | `acceptEdits` | Default if caller omits `permission_mode` |

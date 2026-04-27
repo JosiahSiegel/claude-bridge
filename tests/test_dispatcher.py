@@ -29,7 +29,7 @@ import json
 import time
 from pathlib import Path
 
-from claude_bridge.dispatcher import Dispatcher
+from claude_bridge.dispatcher import STOP_SENTINEL, Dispatcher
 
 
 def _argv_lines(p: Path) -> list[list[str]]:
@@ -889,6 +889,286 @@ async def test_recovery_marks_orphan_when_pid_and_output_missing(
     state = d.get_dispatch("tombstone")
     assert state["status"] == "orphaned"
     assert "alpha" not in d.list_channels()
+
+
+# ---------- recurring dispatches (schedules) ----------
+
+
+async def test_schedule_dispatch_fires_repeated_ticks(
+    fake_claude, state_path
+):
+    d = Dispatcher(
+        state_path=state_path,
+        claude_bin=str(fake_claude),
+        _scheduler_poll_seconds=0.05,
+        _min_schedule_interval_seconds=0.0,
+    )
+    res = await d.create_schedule(
+        prompt="hi",
+        channel="watcher",
+        interval_seconds=0.2,
+    )
+    assert res["ok"], res
+    schedule_id = res["schedule_id"]
+
+    await d.ensure_watchers_running()
+    # ~0.7s should produce at least 3 ticks (first immediate, then ~0.2s apart).
+    await asyncio.sleep(0.8)
+    sched = d.get_schedule(schedule_id)["schedule"]
+    assert sched["tick_count"] >= 3, sched
+
+    await d.cancel_schedule(schedule_id)
+    # No more ticks after cancellation.
+    final_count = d.get_schedule(schedule_id)["schedule"]["tick_count"]
+    await asyncio.sleep(0.5)
+    sched = d.get_schedule(schedule_id)["schedule"]
+    assert sched["status"] == "cancelled"
+    assert sched["tick_count"] == final_count
+
+
+async def test_schedule_respects_until_seconds(fake_claude, state_path):
+    d = Dispatcher(
+        state_path=state_path,
+        claude_bin=str(fake_claude),
+        _scheduler_poll_seconds=0.05,
+        _min_schedule_interval_seconds=0.0,
+    )
+    res = await d.create_schedule(
+        prompt="hi",
+        channel="watcher",
+        interval_seconds=0.2,
+        until_seconds=0.4,
+    )
+    schedule_id = res["schedule_id"]
+    await d.ensure_watchers_running()
+
+    # Wait past the deadline. Loop should mark the schedule completed.
+    await asyncio.sleep(0.9)
+    sched = d.get_schedule(schedule_id)["schedule"]
+    assert sched["status"] == "completed", sched
+
+
+async def test_schedule_self_cancels_on_stop_sentinel(
+    fake_claude, state_path, monkeypatch
+):
+    """A tick whose result text contains the stop sentinel cancels the
+    schedule; no further ticks fire."""
+    monkeypatch.setenv("CLAUDE_FAKE_RESULT", f"all done {STOP_SENTINEL}")
+    d = Dispatcher(
+        state_path=state_path,
+        claude_bin=str(fake_claude),
+        _scheduler_poll_seconds=0.05,
+        _min_schedule_interval_seconds=0.0,
+    )
+    res = await d.create_schedule(
+        prompt="hi", channel="watcher", interval_seconds=0.2
+    )
+    schedule_id = res["schedule_id"]
+    await d.ensure_watchers_running()
+
+    # Give the scheduler one tick + the loop a chance to see the result.
+    await asyncio.sleep(0.6)
+    sched = d.get_schedule(schedule_id)["schedule"]
+    assert sched["status"] == "cancelled", sched
+    assert sched["tick_count"] == 1, sched
+    assert STOP_SENTINEL in (sched.get("error") or "")
+
+
+async def test_schedule_skips_when_prior_tick_running(
+    fake_claude, state_path, monkeypatch
+):
+    """If the prior tick is still running when the next interval fires,
+    don't stack — wait for the next interval."""
+    monkeypatch.setenv("CLAUDE_FAKE_SLEEP", "0.5")
+    d = Dispatcher(
+        state_path=state_path,
+        claude_bin=str(fake_claude),
+        _scheduler_poll_seconds=0.05,
+        _min_schedule_interval_seconds=0.0,
+    )
+    res = await d.create_schedule(
+        prompt="hi", channel="watcher", interval_seconds=0.1
+    )
+    schedule_id = res["schedule_id"]
+    await d.ensure_watchers_running()
+
+    # 0.5s window — interval is 0.1 but each tick takes 0.5, so we
+    # should see at most 1 tick fire (skip the rest).
+    await asyncio.sleep(0.4)
+    sched = d.get_schedule(schedule_id)["schedule"]
+    assert sched["tick_count"] == 1, sched
+    await d.cancel_schedule(schedule_id)
+
+
+async def test_schedule_persists_across_reconstruction(
+    fake_claude, state_path
+):
+    d1 = Dispatcher(
+        state_path=state_path,
+        claude_bin=str(fake_claude),
+        _min_schedule_interval_seconds=0.0,
+    )
+    res = await d1.create_schedule(
+        prompt="hi", channel="watcher", interval_seconds=60
+    )
+    schedule_id = res["schedule_id"]
+    del d1
+
+    d2 = Dispatcher(state_path=state_path, claude_bin=str(fake_claude))
+    sched = d2.get_schedule(schedule_id)
+    assert sched["ok"] is True
+    assert sched["schedule"]["status"] == "active"
+    assert sched["schedule"]["channel"] == "watcher"
+
+
+async def test_schedule_does_not_burst_after_long_gap(
+    fake_claude, state_path
+):
+    """Persisted last_tick_at far in the past must not trigger 60
+    catch-up ticks. Only one fires on the first iteration."""
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    sid = "ghost-schedule"
+    long_ago = time.time() - 3600  # an hour back
+    (state_path.parent / "schedules.json").write_text(
+        json.dumps({
+            "schedules": [{
+                "id": sid,
+                "prompt": "hi",
+                "channel": "watcher",
+                "interval_seconds": 60,
+                "until": None,
+                "args": {},
+                "created_at": long_ago,
+                "last_tick_at": long_ago,
+                "last_job_id": None,
+                "tick_count": 5,
+                "status": "active",
+                "error": None,
+            }],
+        })
+    )
+    d = Dispatcher(
+        state_path=state_path,
+        claude_bin=str(fake_claude),
+        _scheduler_poll_seconds=0.05,
+        _min_schedule_interval_seconds=0.0,
+    )
+    await d.ensure_watchers_running()
+    await asyncio.sleep(0.4)
+    sched = d.get_schedule(sid)["schedule"]
+    # Started at 5 ticks; should fire exactly one in this window.
+    assert sched["tick_count"] == 6, sched
+    await d.cancel_schedule(sid)
+
+
+async def test_schedule_rejects_too_short_interval(fake_claude, state_path):
+    d = Dispatcher(
+        state_path=state_path,
+        claude_bin=str(fake_claude),
+        _min_schedule_interval_seconds=10.0,
+    )
+    res = await d.create_schedule(
+        prompt="hi", channel="watcher", interval_seconds=1.0
+    )
+    assert res["ok"] is False
+    assert "interval_seconds" in res["error"]
+
+
+async def test_schedule_rejects_both_until_and_until_seconds(
+    fake_claude, state_path
+):
+    d = Dispatcher(
+        state_path=state_path,
+        claude_bin=str(fake_claude),
+        _min_schedule_interval_seconds=0.0,
+    )
+    res = await d.create_schedule(
+        prompt="hi",
+        channel="watcher",
+        interval_seconds=1.0,
+        until="2099-01-01T00:00:00Z",
+        until_seconds=10,
+    )
+    assert res["ok"] is False
+    assert "until" in res["error"]
+
+
+async def test_schedule_parses_iso_until(fake_claude, state_path):
+    d = Dispatcher(
+        state_path=state_path,
+        claude_bin=str(fake_claude),
+        _min_schedule_interval_seconds=0.0,
+    )
+    res = await d.create_schedule(
+        prompt="hi",
+        channel="watcher",
+        interval_seconds=1.0,
+        until="2099-01-01T00:00:00Z",
+    )
+    assert res["ok"] is True
+    sched = res["schedule"]
+    assert sched["until"] is not None and sched["until"] > time.time()
+
+
+async def test_cancel_unknown_schedule_returns_clean_error(
+    fake_claude, state_path
+):
+    d = Dispatcher(state_path=state_path, claude_bin=str(fake_claude))
+    res = await d.cancel_schedule("nope")
+    assert res["ok"] is False
+    assert "unknown" in res["error"]
+
+
+# ---------- completion polling ----------
+
+
+async def test_list_completions_filters_by_since(
+    fake_claude, state_path
+):
+    d = Dispatcher(state_path=state_path, claude_bin=str(fake_claude))
+    j1 = await d.dispatch_async("a", channel="alpha")
+    await d.wait_dispatch(j1, max_wait_seconds=5)
+    cursor = d.get_dispatch(j1)["finished_at"]
+
+    j2 = await d.dispatch_async("b", channel="beta")
+    await d.wait_dispatch(j2, max_wait_seconds=5)
+
+    comps = d.list_completions(since=cursor)
+    job_ids = [c["job_id"] for c in comps]
+    assert j1 not in job_ids
+    assert j2 in job_ids
+
+
+async def test_wait_any_completion_returns_when_job_finishes(
+    fake_claude, state_path, monkeypatch
+):
+    monkeypatch.setenv("CLAUDE_FAKE_SLEEP", "0.3")
+    d = Dispatcher(state_path=state_path, claude_bin=str(fake_claude))
+    cursor = time.time()
+    job_id = await d.dispatch_async("hi", channel="alpha")
+
+    comps = await d.wait_any_completion(since=cursor, max_wait_seconds=3)
+    assert any(c["job_id"] == job_id for c in comps)
+
+
+async def test_wait_any_completion_returns_empty_on_timeout(
+    fake_claude, state_path
+):
+    d = Dispatcher(state_path=state_path, claude_bin=str(fake_claude))
+    comps = await d.wait_any_completion(
+        since=time.time() + 1000, max_wait_seconds=0.3
+    )
+    assert comps == []
+
+
+# ---------- discoverability / bridge_help ----------
+
+
+def test_dispatcher_module_exports_stop_sentinel():
+    """Agents can import this from claude_bridge.dispatcher to spell it
+    correctly in prompts."""
+    from claude_bridge.dispatcher import STOP_SENTINEL as imported
+    assert imported == "[BRIDGE_STOP_SCHEDULE]"
 
 
 async def test_list_jobs_strips_raw_for_size(fake_claude, state_path):

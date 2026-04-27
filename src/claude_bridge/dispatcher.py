@@ -65,6 +65,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import datetime as _dt
 import json
 import signal
 import os
@@ -108,6 +109,79 @@ class DispatchResult:
         if self.stderr:
             out["stderr"] = self.stderr
         return out
+
+
+STOP_SENTINEL = "[BRIDGE_STOP_SCHEDULE]"
+"""Magic string a scheduled tick can emit in its result to cancel its own
+schedule. Useful for "watch X until Y" patterns where the prompt knows
+the termination condition but the caller doesn't."""
+
+
+@dataclass
+class Schedule:
+    """A recurring dispatch fired by the bridge's scheduler loop.
+
+    Each tick runs as an independent ``dispatch_async`` job — short
+    individual runs that sidestep the MCP transport's per-call ceiling
+    while still adding up to long-running observation work.
+
+    Schedules persist across bridge restarts. ``last_tick_at`` is used
+    on restart to decide if the next tick is overdue (fire once, don't
+    catch up missed ticks).
+    """
+
+    id: str
+    prompt: str
+    channel: str
+    interval_seconds: float
+    until: float | None  # epoch seconds, None = run forever
+    args: dict[str, Any]
+    created_at: float
+    last_tick_at: float | None = None
+    last_job_id: str | None = None
+    last_tick_status: str | None = None
+    tick_count: int = 0
+    status: str = "active"  # active | completed | cancelled | error
+    error: str | None = None
+
+    def to_persistable(self) -> dict[str, Any]:
+        return {
+            "id": self.id,
+            "prompt": self.prompt,
+            "channel": self.channel,
+            "interval_seconds": self.interval_seconds,
+            "until": self.until,
+            "args": self.args,
+            "created_at": self.created_at,
+            "last_tick_at": self.last_tick_at,
+            "last_job_id": self.last_job_id,
+            "last_tick_status": self.last_tick_status,
+            "tick_count": self.tick_count,
+            "status": self.status,
+            "error": self.error,
+        }
+
+    @classmethod
+    def from_persistable(cls, data: dict[str, Any]) -> "Schedule":
+        return cls(
+            id=str(data["id"]),
+            prompt=str(data.get("prompt", "")),
+            channel=str(data["channel"]),
+            interval_seconds=float(data["interval_seconds"]),
+            until=data.get("until"),
+            args=dict(data.get("args") or {}),
+            created_at=float(data.get("created_at") or time.time()),
+            last_tick_at=data.get("last_tick_at"),
+            last_job_id=data.get("last_job_id"),
+            last_tick_status=data.get("last_tick_status"),
+            tick_count=int(data.get("tick_count") or 0),
+            status=str(data.get("status") or "active"),
+            error=data.get("error"),
+        )
+
+    def public_view(self) -> dict[str, Any]:
+        """The shape returned by ``get_schedule`` / ``list_schedules``."""
+        return self.to_persistable()
 
 
 @dataclass
@@ -175,9 +249,18 @@ class Dispatcher:
     persist_prompts: bool = False
     log_prompts: bool = False
     _watcher_poll_seconds: float = field(default=2.0, repr=False)
+    _scheduler_poll_seconds: float = field(default=5.0, repr=False)
+    _min_schedule_interval_seconds: float = field(default=10.0, repr=False)
     _channel_locks: dict[str, asyncio.Lock] = field(default_factory=dict, init=False)
     _watcher_tasks: dict[str, "asyncio.Task[None]"] = field(
         default_factory=dict, init=False, repr=False
+    )
+    _schedules: dict[str, Schedule] = field(default_factory=dict, init=False)
+    _scheduler_task: "asyncio.Task[None] | None" = field(
+        default=None, init=False, repr=False
+    )
+    _schedules_save_lock: asyncio.Lock = field(
+        default_factory=asyncio.Lock, init=False, repr=False
     )
     _state: dict[str, Any] = field(default_factory=dict, init=False)
     _jobs: dict[str, Job] = field(default_factory=dict, init=False)
@@ -189,6 +272,7 @@ class Dispatcher:
         self._state = self._load_state()
         self._jobs = self._load_jobs()
         self._mark_orphans_on_startup()
+        self._schedules = self._load_schedules()
 
     # ----- state persistence -----
 
@@ -372,6 +456,43 @@ class Dispatcher:
         job.result = result.to_dict()
         job.error = None if result.ok else result.error
         job.finished_at = time.time()
+
+    # ----- schedule persistence -----
+
+    @property
+    def _schedules_path(self) -> Path:
+        return self.state_path.parent / "schedules.json"
+
+    def _load_schedules(self) -> dict[str, Schedule]:
+        path = self._schedules_path
+        if not path.exists():
+            return {}
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return {}
+        out: dict[str, Schedule] = {}
+        for entry in data.get("schedules", []):
+            try:
+                sched = Schedule.from_persistable(entry)
+            except (KeyError, TypeError, ValueError):
+                continue
+            out[sched.id] = sched
+        return out
+
+    def _save_schedules_sync(self) -> None:
+        path = self._schedules_path
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        payload = {
+            "schedules": [s.to_persistable() for s in self._schedules.values()]
+        }
+        tmp.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        os.replace(tmp, path)
+
+    async def _save_schedules(self) -> None:
+        async with self._schedules_save_lock:
+            self._save_schedules_sync()
 
     # ----- structured logging -----
 
@@ -814,14 +935,295 @@ class Dispatcher:
         )
 
     async def ensure_watchers_running(self) -> None:
-        """Spawn watchers for any persisted ``running`` jobs.
+        """Spawn watchers for any persisted ``running`` jobs and bring up
+        the scheduler loop if it isn't already running.
 
-        Called from the server's startup path. Safe to call repeatedly;
-        only spawns one watcher per job.
+        Called from every async MCP tool entry. Safe and cheap to call
+        repeatedly; only spawns one watcher per job and one scheduler
+        task per Dispatcher.
         """
         for job in self._jobs.values():
             if job.status == "running" and job.task is None:
                 self._spawn_watcher(job)
+        if self._scheduler_task is None or self._scheduler_task.done():
+            try:
+                loop = asyncio.get_running_loop()
+            except RuntimeError:
+                return
+            self._scheduler_task = loop.create_task(
+                self._scheduler_loop(), name="bridge-scheduler"
+            )
+
+    # ----- recurring dispatches (schedules) -----
+
+    async def _scheduler_loop(self) -> None:
+        """Wake periodically; for each active schedule, decide whether
+        a tick is due and fire one if so.
+
+        We never "catch up" missed ticks. If the bridge was down for an
+        hour and a 5-minute schedule has 12 missed ticks, we fire one
+        on the first iteration and then resume normal cadence. This
+        avoids burst-firing after restarts and keeps the schedule
+        intent ("check every N min") closer to the user's mental model.
+        """
+        while True:
+            try:
+                await self._tick_scheduler_once()
+            except asyncio.CancelledError:
+                return
+            except Exception as exc:  # noqa: BLE001 — never let the loop die
+                self._log_event(
+                    "scheduler_loop_error",
+                    error=f"{type(exc).__name__}: {exc}",
+                )
+            try:
+                await asyncio.sleep(self._scheduler_poll_seconds)
+            except asyncio.CancelledError:
+                return
+
+    async def _tick_scheduler_once(self) -> None:
+        now = time.time()
+        # Iterate a snapshot — schedules can be added/cancelled mid-loop.
+        for schedule in list(self._schedules.values()):
+            if schedule.status != "active":
+                continue
+
+            # 1. Did the last tick emit the stop sentinel? If so,
+            #    self-cancel before considering whether to fire again.
+            if schedule.last_job_id:
+                last_job = self._jobs.get(schedule.last_job_id)
+                if last_job is not None and last_job.status == "done":
+                    last_text = ""
+                    if last_job.result is not None:
+                        last_text = str(last_job.result.get("result") or "")
+                    if STOP_SENTINEL in last_text:
+                        schedule.status = "cancelled"
+                        schedule.error = (
+                            f"tick {schedule.tick_count} emitted "
+                            f"{STOP_SENTINEL}"
+                        )
+                        await self._save_schedules()
+                        self._log_event(
+                            "schedule_self_cancelled",
+                            schedule_id=schedule.id,
+                            tick_count=schedule.tick_count,
+                        )
+                        continue
+
+            # 2. Past the until?
+            if schedule.until is not None and now >= schedule.until:
+                schedule.status = "completed"
+                await self._save_schedules()
+                self._log_event(
+                    "schedule_completed",
+                    schedule_id=schedule.id,
+                    tick_count=schedule.tick_count,
+                    reason="until_reached",
+                )
+                continue
+
+            # 3. Is a tick due?
+            if schedule.last_tick_at is None:
+                due = True
+            else:
+                due = (now - schedule.last_tick_at) >= schedule.interval_seconds
+            if not due:
+                continue
+
+            # 4. If the prior tick is still running, skip this one.
+            if schedule.last_job_id:
+                last_job = self._jobs.get(schedule.last_job_id)
+                if last_job is not None and last_job.status == "running":
+                    continue
+
+            # 5. Fire.
+            try:
+                job_id = await self.dispatch_async(
+                    prompt=schedule.prompt,
+                    channel=schedule.channel,
+                    timeout_seconds=int(
+                        schedule.args.get("timeout_seconds", 300)
+                    ),
+                    permission_mode=str(
+                        schedule.args.get("permission_mode")
+                        or "acceptEdits"
+                    ),
+                    cwd=schedule.args.get("cwd"),
+                )
+            except Exception as exc:  # noqa: BLE001
+                schedule.status = "error"
+                schedule.error = f"{type(exc).__name__}: {exc}"
+                await self._save_schedules()
+                self._log_event(
+                    "schedule_tick_error",
+                    schedule_id=schedule.id,
+                    error=schedule.error,
+                )
+                continue
+            schedule.last_tick_at = now
+            schedule.last_job_id = job_id
+            schedule.tick_count += 1
+            await self._save_schedules()
+            self._log_event(
+                "schedule_tick",
+                schedule_id=schedule.id,
+                channel=schedule.channel,
+                job_id=job_id,
+                tick_count=schedule.tick_count,
+            )
+
+    async def create_schedule(
+        self,
+        prompt: str,
+        channel: str,
+        interval_seconds: float,
+        until: str | None = None,
+        until_seconds: float | None = None,
+        timeout_seconds: int = 300,
+        permission_mode: str = "acceptEdits",
+        cwd: str | None = None,
+    ) -> dict[str, Any]:
+        """Create a recurring dispatch.
+
+        Returns either ``{"ok": True, "schedule_id": ..., "schedule": ...}``
+        or ``{"ok": False, "error": ...}`` for validation failures.
+        Does not raise — same fail-soft contract as ``dispatch``.
+        """
+        if not prompt.strip():
+            return {"ok": False, "error": "prompt is empty"}
+        if not channel.strip():
+            return {"ok": False, "error": "channel is empty"}
+        if interval_seconds < self._min_schedule_interval_seconds:
+            return {
+                "ok": False,
+                "error": (
+                    f"interval_seconds must be at least "
+                    f"{self._min_schedule_interval_seconds}s "
+                    "(prevents runaway tick storms)"
+                ),
+            }
+        if until is not None and until_seconds is not None:
+            return {
+                "ok": False,
+                "error": "specify either 'until' or 'until_seconds', not both",
+            }
+
+        until_epoch: float | None = None
+        if until is not None:
+            until_epoch = self._parse_until(until)
+            if until_epoch is None:
+                return {
+                    "ok": False,
+                    "error": (
+                        f"invalid 'until' (expected ISO 8601 like "
+                        f"'2026-04-27T20:00:00Z'): {until!r}"
+                    ),
+                }
+        elif until_seconds is not None:
+            if until_seconds <= 0:
+                return {"ok": False, "error": "until_seconds must be positive"}
+            until_epoch = time.time() + float(until_seconds)
+
+        schedule = Schedule(
+            id=str(uuid.uuid4()),
+            prompt=prompt,
+            channel=channel,
+            interval_seconds=float(interval_seconds),
+            until=until_epoch,
+            args={
+                "timeout_seconds": int(timeout_seconds),
+                "permission_mode": permission_mode,
+                "cwd": cwd,
+            },
+            created_at=time.time(),
+        )
+        self._schedules[schedule.id] = schedule
+        await self._save_schedules()
+        self._log_event(
+            "schedule_created",
+            schedule_id=schedule.id,
+            channel=channel,
+            interval_seconds=interval_seconds,
+            until=until_epoch,
+        )
+        return {"ok": True, "schedule_id": schedule.id, "schedule": schedule.public_view()}
+
+    @staticmethod
+    def _parse_until(s: str) -> float | None:
+        """Parse an ISO 8601 string into an epoch timestamp; ``None`` on
+        failure. Python 3.11's ``fromisoformat`` accepts the trailing ``Z``."""
+        try:
+            dt = _dt.datetime.fromisoformat(s)
+        except ValueError:
+            return None
+        if dt.tzinfo is None:
+            # Naive — treat as local time, same as datetime.timestamp() does.
+            return dt.timestamp()
+        return dt.timestamp()
+
+    def list_schedules(self) -> list[dict[str, Any]]:
+        return [s.public_view() for s in self._schedules.values()]
+
+    def get_schedule(self, schedule_id: str) -> dict[str, Any]:
+        sched = self._schedules.get(schedule_id)
+        if sched is None:
+            return {"ok": False, "error": f"unknown schedule_id: {schedule_id}"}
+        return {"ok": True, "schedule": sched.public_view()}
+
+    async def cancel_schedule(self, schedule_id: str) -> dict[str, Any]:
+        sched = self._schedules.get(schedule_id)
+        if sched is None:
+            return {"ok": False, "error": f"unknown schedule_id: {schedule_id}"}
+        if sched.status != "active":
+            return {
+                "ok": True,
+                "cancelled": False,
+                "reason": "already_inactive",
+                "status": sched.status,
+            }
+        sched.status = "cancelled"
+        await self._save_schedules()
+        self._log_event(
+            "schedule_cancelled",
+            schedule_id=schedule_id,
+            tick_count=sched.tick_count,
+        )
+        return {"ok": True, "cancelled": True, "schedule": sched.public_view()}
+
+    # ----- completion polling -----
+
+    def list_completions(
+        self, since: float = 0.0, limit: int = 50
+    ) -> list[dict[str, Any]]:
+        """Jobs whose ``finished_at > since``, oldest finish first."""
+        out: list[dict[str, Any]] = []
+        for job in self._jobs.values():
+            fin = job.finished_at
+            if fin is None or fin <= since:
+                continue
+            entry = self.get_dispatch(job.id)
+            if "raw" in entry:
+                entry = {k: v for k, v in entry.items() if k != "raw"}
+            entry["finished_at"] = fin
+            out.append(entry)
+        out.sort(key=lambda e: e.get("finished_at") or 0.0)
+        return out[:limit] if limit > 0 else out
+
+    async def wait_any_completion(
+        self, since: float = 0.0, max_wait_seconds: float = 50.0
+    ) -> list[dict[str, Any]]:
+        """Block up to ``max_wait_seconds`` for at least one completion
+        whose ``finished_at > since``. Polls at 1s — fast enough for
+        Cowork's "anything new at the start of this turn?" pattern."""
+        deadline = time.monotonic() + max_wait_seconds
+        while True:
+            comps = self.list_completions(since=since)
+            if comps:
+                return comps
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return []
+            await asyncio.sleep(min(1.0, remaining))
 
     # ----- async dispatch / polling -----
 
