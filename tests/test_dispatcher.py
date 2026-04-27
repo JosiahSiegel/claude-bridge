@@ -1236,6 +1236,76 @@ async def test_events_bounded_by_max_events(state_path, fake_claude):
     assert len(events) == 5
 
 
+async def test_notable_only_filters_out_chatter(fake_claude, state_path):
+    """notable_only=True drops dispatch_start, schedule_tick, schedule_created
+    but keeps terminal transitions and failures."""
+    d = Dispatcher(state_path=state_path, claude_bin=str(fake_claude))
+    job_id = await d.dispatch_async("hi", channel="alpha")
+    await d.wait_dispatch(job_id, max_wait_seconds=5)
+
+    all_events = d.list_events()
+    notable = d.list_events(notable_only=True)
+
+    all_types = {e["event"] for e in all_events}
+    notable_types = {e["event"] for e in notable}
+
+    # Sanity: dispatch_start was logged at all.
+    assert "dispatch_start" in all_types
+    # Filter excludes the chatter.
+    assert "dispatch_start" not in notable_types
+    # But keeps the terminal transition.
+    assert "dispatch_end" in notable_types
+
+
+async def test_notable_only_keeps_failure_events(fake_claude, state_path):
+    """webhook_failed and dispatch_error are notable."""
+    d = Dispatcher(state_path=state_path, claude_bin=str(fake_claude))
+    # Webhook failure path — unreachable URL.
+    job_id = await d.dispatch_async(
+        "hi",
+        channel="alpha",
+        notify_url="http://127.0.0.1:1/never-listening",
+    )
+    await d.wait_dispatch(job_id, max_wait_seconds=5)
+    # Give the webhook a beat to fail.
+    for _ in range(40):
+        if d.list_events(types=["webhook_failed"]):
+            break
+        await asyncio.sleep(0.05)
+
+    notable_types = {e["event"] for e in d.list_events(notable_only=True)}
+    assert "webhook_failed" in notable_types
+    assert "webhook_sent" not in notable_types  # success is not notable
+
+
+async def test_notable_only_composes_with_since_and_types(
+    fake_claude, state_path
+):
+    d = Dispatcher(state_path=state_path, claude_bin=str(fake_claude))
+    j1 = await d.dispatch_async("a", channel="alpha")
+    await d.wait_dispatch(j1, max_wait_seconds=5)
+    cursor = max(e["ts"] for e in d.list_events())
+    j2 = await d.dispatch_async("b", channel="beta")
+    await d.wait_dispatch(j2, max_wait_seconds=5)
+
+    # since + notable_only — only j2's terminal events.
+    res = d.list_events(since=cursor, notable_only=True)
+    assert all(e["event"] in {"dispatch_end"} or
+               e["event"] not in {"dispatch_start"} for e in res)
+    job_ids = {e.get("job_id") for e in res if "job_id" in e}
+    assert j1 not in job_ids
+    assert j2 in job_ids
+
+    # since + types + notable_only intersect (types wins for explicit lookup).
+    explicit = d.list_events(
+        since=cursor,
+        types=["dispatch_start"],  # would be notable_only=False's territory
+        notable_only=True,
+    )
+    # dispatch_start isn't in NOTABLE_EVENTS — intersection is empty.
+    assert explicit == []
+
+
 async def test_list_events_oldest_first(fake_claude, state_path):
     d = Dispatcher(state_path=state_path, claude_bin=str(fake_claude))
     d._log_event("a")

@@ -118,6 +118,37 @@ schedule. Useful for "watch X until Y" patterns where the prompt knows
 the termination condition but the caller doesn't."""
 
 
+NOTABLE_EVENTS: frozenset[str] = frozenset({
+    # Dispatch terminal transitions (or recovery transitions that
+    # represent the *real* outcome of a previously-abandoned job).
+    "dispatch_end",
+    "dispatch_cancelled",
+    "dispatch_abandoned",
+    "dispatch_error",
+    "dispatch_orphan_finalized",
+    "dispatch_orphan_finalized_missing",
+    # Schedule lifecycle worth surfacing to a human.
+    "schedule_activated",
+    "schedule_self_cancelled",
+    "schedule_cancelled",
+    "schedule_completed",
+    "schedule_tick_error",
+    # Failures of best-effort side channels.
+    "webhook_failed",
+    "scheduler_loop_error",
+    # Bridge-startup recovery only logs this if there was actually
+    # something to report (orphans found, jobs reattached, etc.).
+    "bridge_init_recovery",
+})
+"""Event names that cross the bar for "tell the human about this."
+
+Excluded on purpose: ``dispatch_start`` and ``schedule_tick`` (chatty
+per-call markers), ``schedule_created`` (the create call's return value
+is the ack), ``bridge_init_subprocess_alive`` (recovery diagnostic),
+``webhook_sent`` (success delivery — boring). Re-classify here in one
+place; ``list_events(notable_only=True)`` reads from this set."""
+
+
 @dataclass
 class Schedule:
     """A recurring dispatch fired by the bridge's scheduler loop.
@@ -598,16 +629,26 @@ class Dispatcher:
         since: float = 0.0,
         limit: int = 100,
         types: list[str] | None = None,
+        notable_only: bool = False,
     ) -> list[dict[str, Any]]:
         """Return events whose ``ts > since``, oldest first, capped at
-        ``limit``. Optional ``types`` filters by event name."""
+        ``limit``.
+
+        ``types`` is an explicit allow-list of event names.
+        ``notable_only=True`` filters to the curated ``NOTABLE_EVENTS``
+        set — terminal transitions and failures, no per-tick / per-start
+        chatter. The two filters compose (intersection).
+        """
         out: list[dict[str, Any]] = []
         types_set = set(types) if types else None
         for record in self._events:
             ts = record.get("ts")
             if not isinstance(ts, (int, float)) or ts <= since:
                 continue
-            if types_set is not None and record.get("event") not in types_set:
+            event_name = record.get("event")
+            if types_set is not None and event_name not in types_set:
+                continue
+            if notable_only and event_name not in NOTABLE_EVENTS:
                 continue
             out.append(record)
             if limit > 0 and len(out) >= limit:

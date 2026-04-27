@@ -71,7 +71,7 @@ from pathlib import Path
 
 from mcp.server.fastmcp import FastMCP
 
-from .dispatcher import STOP_SENTINEL, Dispatcher
+from .dispatcher import NOTABLE_EVENTS, STOP_SENTINEL, Dispatcher
 
 _STATE_PATH = Path(
     os.environ.get(
@@ -128,6 +128,7 @@ def bridge_help() -> dict:
             "timeouts, MCP cancellations, and bridge restarts."
         ),
         "stop_sentinel": STOP_SENTINEL,
+        "notable_event_types": sorted(NOTABLE_EVENTS),
         "tools": {
             "dispatch": {
                 "group": "synchronous",
@@ -294,20 +295,23 @@ def bridge_help() -> dict:
                 "group": "event_log",
                 "summary": (
                     "Bridge-wide structured event stream with cursor "
-                    "pagination. Records dispatch lifecycle, schedule "
-                    "ticks, sentinel hits, recovery actions."
+                    "pagination and a notable_only filter. Records "
+                    "dispatch lifecycle, schedule ticks, sentinel hits, "
+                    "webhook outcomes, recovery actions."
                 ),
                 "when_to_use": (
                     "Top of every turn: 'what happened while I was "
-                    "offline?' — one call gets you every notable "
-                    "event since your cursor, including events from "
-                    "schedules whose ticks completed without you "
-                    "watching them. Cheaper than scanning "
+                    "offline?'. Pass notable_only=True to get only "
+                    "state-transitions worth surfacing to a human "
+                    "(skips dispatch_start, schedule_tick, etc.). One "
+                    "call covers schedules whose ticks completed without "
+                    "you watching them — cheaper than scanning "
                     "list_completions for sentinels."
                 ),
                 "when_not_to_use": (
                     "If you only care about job results (no schedule "
-                    "context), list_completions is cheaper."
+                    "context), list_completions is cheaper. For full "
+                    "forensic detail, leave notable_only=False."
                 ),
             },
             "list_channels": {
@@ -387,17 +391,12 @@ def bridge_help() -> dict:
             {
                 "name": "What happened while I was offline? (event log)",
                 "steps": [
-                    "events = list_events(since=last_seen_ts)",
-                    "# Filter to surfacing-worthy events:",
-                    "# types=['schedule_self_cancelled', 'schedule_completed', 'dispatch_end']",
+                    "events = list_events(since=last_seen_ts, notable_only=True)",
+                    "# notable_only=True drops the noise: dispatch_start, schedule_tick, etc.",
                     "for e in events: handle e by event_type",
                     "last_seen_ts = max(e['ts'] for e in events) if events else last_seen_ts",
                 ],
-                "example": (
-                    "list_events(since=last_seen_ts, "
-                    "types=['schedule_self_cancelled', "
-                    "'schedule_completed'])"
-                ),
+                "example": "list_events(since=last_seen_ts, notable_only=True)",
             },
             {
                 "name": "Pipeline: do B after A finishes",
@@ -871,36 +870,57 @@ def list_events(
     since: float = 0.0,
     limit: int = 100,
     types: list[str] | None = None,
+    notable_only: bool = False,
 ) -> dict:
-    """Return notable bridge events whose ``ts > since``, oldest first.
+    """Return bridge events whose ``ts > since``, oldest first.
 
-    The event log is the right tool for "what happened while I was
-    offline?" — it records dispatch starts/ends, schedule ticks,
-    sentinel hits, schedule completions, and recovery actions. The
-    buffer is bounded (default 1000 events) and persisted across bridge
-    restarts.
+    The event log records dispatch starts/ends, schedule ticks,
+    sentinel hits, schedule completions, webhook outcomes, and recovery
+    actions. The buffer is bounded (default 1000 events) and persisted
+    across bridge restarts.
+
+    Two read modes:
+
+    * **Debug mode** (``notable_only=False``, the default): every
+      event. Good for forensic post-mortem of a workflow.
+    * **Surfacing mode** (``notable_only=True``): only state
+      transitions worth reporting to a human — terminal dispatch
+      states, schedule completions / cancellations / errors, webhook
+      failures, recovery actions. Skips ``dispatch_start``,
+      ``schedule_tick``, ``schedule_created``, ``webhook_sent``, and
+      ``bridge_init_subprocess_alive``. **This is what an orchestrator
+      wants for "what should I tell the user about?"**.
 
     Cursor pattern: pass ``since=0`` for everything, then on each
-    subsequent call pass the largest ``ts`` you saw. The buffer is
-    oldest-first, so pagination is straightforward.
+    subsequent call pass the largest ``ts`` you saw.
 
-    Common ``types`` to filter by:
+    ``types`` is an explicit allow-list — composes with
+    ``notable_only`` (intersection).
+
+    Common ``types``:
 
     * Dispatch lifecycle: ``dispatch_start``, ``dispatch_end``,
       ``dispatch_cancelled``, ``dispatch_abandoned``, ``dispatch_error``,
       ``dispatch_orphan_finalized``.
     * Schedule lifecycle: ``schedule_created``, ``schedule_tick``,
-      ``schedule_self_cancelled``, ``schedule_cancelled``,
-      ``schedule_completed``, ``schedule_tick_error``.
+      ``schedule_activated``, ``schedule_self_cancelled``,
+      ``schedule_cancelled``, ``schedule_completed``,
+      ``schedule_tick_error``.
+    * Webhook outcomes: ``webhook_sent``, ``webhook_failed``.
     * Recovery: ``bridge_init_recovery``, ``bridge_init_subprocess_alive``.
 
     Each event has ``ts`` (epoch seconds), ``event`` (type), plus
     type-specific fields (``job_id``, ``schedule_id``, ``channel``,
     ``ok``, ``duration_ms``, etc.).
+
+    Note: events generated before this feature shipped are gone — the
+    in-memory buffer only captures from the current bridge process
+    onward. Anything you persisted before then lives in the optional
+    ``CLAUDE_BRIDGE_LOG`` JSONL file (if you enabled it).
     """
     return {
         "events": dispatcher.list_events(
-            since=since, limit=limit, types=types
+            since=since, limit=limit, types=types, notable_only=notable_only
         )
     }
 

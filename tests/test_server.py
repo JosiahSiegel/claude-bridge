@@ -68,6 +68,20 @@ def test_bridge_help_advertises_stop_sentinel_literally():
     assert help_doc["stop_sentinel"] == "[BRIDGE_STOP_SCHEDULE]"
 
 
+def test_bridge_help_lists_notable_event_types():
+    """An agent calling list_events(notable_only=True) should be able to
+    learn from bridge_help which event types make the cut."""
+    help_doc = server.bridge_help()
+    notable = set(help_doc["notable_event_types"])
+    # Spot-check the load-bearing entries on both sides of the line.
+    assert "dispatch_end" in notable
+    assert "schedule_self_cancelled" in notable
+    assert "webhook_failed" in notable
+    assert "dispatch_start" not in notable  # chatty
+    assert "schedule_tick" not in notable   # chatty
+    assert "webhook_sent" not in notable    # success delivery
+
+
 def test_bridge_help_durability_section_is_specific():
     help_doc = server.bridge_help()
     persists = help_doc["durability"]["persists_to_disk"]

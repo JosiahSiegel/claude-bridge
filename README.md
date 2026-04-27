@@ -316,27 +316,41 @@ webhook (if configured) and does not cancel the in-flight tick — use
 
 ### Event log (turn-level "what happened while I was offline?")
 
-#### `list_events(since=0, limit=100, types=None)`
+#### `list_events(since=0, limit=100, types=None, notable_only=False)`
 
-Bridge-wide structured event stream. Records every notable transition:
-`dispatch_start`, `dispatch_end`, `dispatch_cancelled`,
-`dispatch_abandoned`, `dispatch_error`, `dispatch_orphan_finalized`,
-`schedule_created`, `schedule_tick`, `schedule_self_cancelled`,
-`schedule_cancelled`, `schedule_completed`, `schedule_activated`,
-`webhook_sent`, `webhook_failed`, `bridge_init_recovery`. The buffer is
-bounded (default 1000) and persisted to `events.json` so it survives
-restarts.
+Bridge-wide structured event stream. Records every state transition:
+dispatch lifecycle, schedule lifecycle, webhook outcomes, recovery
+actions. The buffer is bounded (default 1000) and persisted to
+`events.json` so it survives restarts.
+
+Two read modes:
+
+* **Debug mode** (`notable_only=False`, default): every event,
+  including chatter like `dispatch_start` and `schedule_tick`. Right
+  for forensic post-mortem.
+* **Surfacing mode** (`notable_only=True`): only state transitions
+  worth surfacing to a human. Drops `dispatch_start`, `schedule_tick`,
+  `schedule_created`, `webhook_sent`, `bridge_init_subprocess_alive`.
+  Keeps every terminal transition and every failure. **This is what
+  an orchestrator wants for "what should I tell the user about?"**
 
 Cursor pattern: pass `since=0` for everything, then track the largest
-`ts` you've seen. Optional `types` filters by event name. Returns
-oldest-first.
+`ts` you've seen. `types` is an explicit allow-list and composes with
+`notable_only` (intersection). Returns oldest-first.
 
 ```
-events = list_events(since=last_seen_ts,
-                     types=["schedule_self_cancelled", "schedule_completed", "dispatch_end"])
+events = list_events(since=last_seen_ts, notable_only=True)
 for e in events: surface(e)
 last_seen_ts = max(e["ts"] for e in events) if events else last_seen_ts
 ```
+
+Call `bridge_help()` and read `notable_event_types` to see the curated
+set programmatically.
+
+> **Heads-up**: events are only recorded from the moment the event-log
+> feature is running. Anything that fired on a prior bridge process
+> (or before this feature shipped) is gone. Going forward, every state
+> transition is captured.
 
 ### Completion polling (turn-level "anything new?")
 
