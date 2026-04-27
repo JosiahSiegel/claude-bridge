@@ -1,9 +1,39 @@
 # claude-bridge
 
+[![tests](https://github.com/JosiahSiegel/claude-bridge/actions/workflows/test.yml/badge.svg)](https://github.com/JosiahSiegel/claude-bridge/actions/workflows/test.yml)
+[![python](https://img.shields.io/badge/python-3.11%20%7C%203.12%20%7C%203.13-blue.svg)](https://github.com/JosiahSiegel/claude-bridge)
+[![license](https://img.shields.io/badge/license-MIT-blue.svg)](./LICENSE)
+
 An MCP server that lets host-side Claude Cowork dispatch work into
 **Claude Code running inside your devcontainer**, over stdio. Cowork
 launches the bridge with `docker exec -i`; the bridge shells to
 `claude -p` and returns a structured result.
+
+## Install
+
+Inside the devcontainer:
+
+```bash
+# from PyPI (once published — see CHANGELOG.md):
+pip install claude-bridge-mcp
+
+# or pin to the latest main branch:
+pip install "git+https://github.com/JosiahSiegel/claude-bridge.git@main"
+
+# or for development (editable + dev deps):
+git clone https://github.com/JosiahSiegel/claude-bridge.git
+cd claude-bridge
+pip install -e ".[dev]"
+```
+
+> **Note on names**: the PyPI distribution is `claude-bridge-mcp` (the
+> bare `claude-bridge` name was already taken by an unrelated HTTP
+> gateway). The Python import (`import claude_bridge`), the CLI
+> (`claude-bridge`), and the MCP server name (`claude-bridge`) are
+> unchanged — only the `pip install` argument differs.
+
+A reference Dockerfile and `devcontainer.json` for downstream projects
+live in [`examples/devcontainer/`](./examples/devcontainer/).
 
 ## Quickstart
 
@@ -14,7 +44,7 @@ Desktop fully restarted.
 **1. Install in the container.**
 
 ```bash
-pip install claude-bridge
+pip install claude-bridge-mcp
 which claude-bridge      # copy this path — you'll paste it in step 2
 ```
 
@@ -419,6 +449,20 @@ The contract:
   written by `claude -p` directly (not via pipes the bridge has to
   drain). Output survives bridge crashes and asyncio task cancellations.
 
+### Scheduler + watcher liveness is decoupled from FastMCP
+
+The scheduler task and any orphan-reaping watchers are bootstrapped
+by `ensure_watchers_running()`, which runs at every async tool entry
+**and** on a wall-clock cadence from a daemon supervisor thread. The
+thread lives outside FastMCP's asyncio task lifecycle, so even if
+FastMCP cancels every in-flight task on a transport disconnect, the
+supervisor revives the scheduler within one poll interval (~5s by
+default).
+
+Without this, an abandoned tick during a transport blip could leave
+a schedule "active but not firing" until the next external MCP call
+woke things up — see [issue notes in CLAUDE.md, invariant 25](./CLAUDE.md).
+
 ### Subprocess lifetime is decoupled from the bridge
 
 For `dispatch_async`, the subprocess is spawned with
@@ -571,13 +615,33 @@ its own.
 
 ## Development
 
+See [`CONTRIBUTING.md`](./CONTRIBUTING.md) for the full guide. TL;DR:
+
 ```bash
 python -m venv .venv
 .venv/bin/pip install -e ".[dev]"
-.venv/bin/pytest             # 13 tests, ~3s
+.venv/bin/pytest             # 83 tests, ~20s
 ```
 
 Tests use a fake `claude` binary (a Python stub in `tests/conftest.py`)
 so they verify real subprocess behavior — argv formation, JSON parsing,
-exit codes, timeouts, env passthrough, per-call cwd — without a real
-Anthropic API key.
+exit codes, timeouts, env passthrough, per-call cwd, cancellation
+handling, schedule firing, and webhook delivery against a loopback
+HTTP server — all without a real Anthropic API key.
+
+CI (GitHub Actions) runs the test matrix on Python 3.11 / 3.12 / 3.13
+plus a sanity wheel build.
+
+## Releases
+
+See [`CHANGELOG.md`](./CHANGELOG.md). Versioning follows
+[Semantic Versioning](https://semver.org/) once `0.1.0` is published.
+The single source of truth for the version is
+`src/claude_bridge/__init__.py`; `pyproject.toml` reads it via
+`hatch`'s dynamic version mechanism.
+
+## Reporting issues / security
+
+* General bugs and feature requests:
+  <https://github.com/JosiahSiegel/claude-bridge/issues>
+* Security vulnerabilities: see [`SECURITY.md`](./SECURITY.md).

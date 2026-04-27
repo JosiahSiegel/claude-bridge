@@ -1,13 +1,49 @@
 [project]
-name = "claude-bridge"
-version = "0.1.0"
+name = "claude-bridge-mcp"
 description = "MCP server that bridges host-side Claude Cowork to Claude Code running inside a devcontainer."
 readme = "README.md"
 requires-python = ">=3.11"
-license = { text = "MIT" }
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [
+    { name = "Josiah Siegel" },
+]
+keywords = [
+    "claude",
+    "claude-code",
+    "cowork",
+    "mcp",
+    "model-context-protocol",
+    "devcontainer",
+    "docker",
+    "agent",
+    "automation",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Operating System :: POSIX :: Linux",
+    "Operating System :: MacOS",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development",
+    "Topic :: Software Development :: Build Tools",
+    "Topic :: System :: Distributed Computing",
+    "Typing :: Typed",
+]
 dependencies = [
     "mcp>=1.2.0",
 ]
+dynamic = ["version"]
+
+[project.urls]
+Homepage = "https://github.com/JosiahSiegel/claude-bridge"
+Source = "https://github.com/JosiahSiegel/claude-bridge"
+Issues = "https://github.com/JosiahSiegel/claude-bridge/issues"
+Changelog = "https://github.com/JosiahSiegel/claude-bridge/blob/main/CHANGELOG.md"
 
 [project.scripts]
 claude-bridge = "claude_bridge.server:main"
@@ -22,8 +58,28 @@ dev = [
 requires = ["hatchling"]
 build-backend = "hatchling.build"
 
+[tool.hatch.version]
+path = "src/claude_bridge/__init__.py"
+
 [tool.hatch.build.targets.wheel]
 packages = ["src/claude_bridge"]
+
+[tool.hatch.build.targets.sdist]
+# Explicit sdist contents — keeps PyPI uploads small and prevents
+# accidentally shipping local scratch / .venv contents from the
+# project root. Tests are deliberately omitted: they're discoverable
+# from the source repo and don't need to ship in the sdist.
+include = [
+    "src/",
+    "README.md",
+    "LICENSE",
+    "CHANGELOG.md",
+    "pyproject.toml",
+    "CLAUDE.md",
+    "CONTRIBUTING.md",
+    "SECURITY.md",
+    "examples/",
+]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

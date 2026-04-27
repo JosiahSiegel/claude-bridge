@@ -62,6 +62,16 @@ over MCP):
   on-disk job records. Off by default.
 * ``CLAUDE_BRIDGE_LOG_PROMPTS`` — ``1`` to include prompts in the JSONL
   log. Off by default.
+* ``CLAUDE_BRIDGE_ALLOW_PRIVATE_WEBHOOKS`` — ``1`` to permit
+  ``notify_url`` values that resolve to loopback / link-local /
+  private addresses (RFC1918 etc). Off by default; the bridge rejects
+  such URLs at ``dispatch_async`` / ``schedule_dispatch`` time as an
+  SSRF guard. Set this only if your relay genuinely runs on the same
+  host (sidecar container, host loopback) and you accept the
+  consequences.
+* ``CLAUDE_BRIDGE_MIN_SCHEDULE_INTERVAL`` — minimum allowed
+  ``interval_seconds`` on ``schedule_dispatch``. Default ``10``;
+  prevents runaway tick storms. Set lower only for testing.
 """
 
 from __future__ import annotations
@@ -88,6 +98,23 @@ _LOG_PATH_ENV = os.environ.get("CLAUDE_BRIDGE_LOG")
 _LOG_PATH = Path(_LOG_PATH_ENV) if _LOG_PATH_ENV else None
 _PERSIST_PROMPTS = os.environ.get("CLAUDE_BRIDGE_PERSIST_PROMPTS") == "1"
 _LOG_PROMPTS = os.environ.get("CLAUDE_BRIDGE_LOG_PROMPTS") == "1"
+_ALLOW_PRIVATE_WEBHOOKS = (
+    os.environ.get("CLAUDE_BRIDGE_ALLOW_PRIVATE_WEBHOOKS") == "1"
+)
+
+
+def _parse_min_interval(raw: str | None) -> float:
+    if raw is None:
+        return 10.0
+    try:
+        return float(raw)
+    except ValueError:
+        return 10.0
+
+
+_MIN_SCHEDULE_INTERVAL = _parse_min_interval(
+    os.environ.get("CLAUDE_BRIDGE_MIN_SCHEDULE_INTERVAL")
+)
 
 mcp: FastMCP = FastMCP("claude-bridge")
 dispatcher = Dispatcher(
@@ -97,6 +124,8 @@ dispatcher = Dispatcher(
     log_path=_LOG_PATH,
     persist_prompts=_PERSIST_PROMPTS,
     log_prompts=_LOG_PROMPTS,
+    allow_private_webhooks=_ALLOW_PRIVATE_WEBHOOKS,
+    min_schedule_interval_seconds=_MIN_SCHEDULE_INTERVAL,
 )
 
 
@@ -441,7 +470,9 @@ def bridge_help() -> dict:
                 "successor stays in 'waiting' until the predecessor "
                 "completes / cancels / errors, then transitions to "
                 "'active' on the next scheduler tick. Cycles are "
-                "rejected at creation."
+                "rejected at creation. Naive ``until`` datetimes (no "
+                "timezone) are interpreted as UTC, not local time, so "
+                "schedules behave the same regardless of container TZ."
             ),
             "webhooks": (
                 "dispatch_async and schedule_dispatch accept notify_url "
@@ -500,8 +531,10 @@ def bridge_help() -> dict:
             "survives": [
                 "MCP transport timeouts (subprocess detached from asyncio task)",
                 "FastMCP cancelling tool calls (job marked 'abandoned', watcher reaps)",
+                "FastMCP cancelling the scheduler/watcher tasks (a daemon supervisor thread re-runs ensure_watchers_running on a wall-clock cadence — independent of the asyncio loop's task lifecycle, so the scheduler revives within one poll interval)",
                 "bridge process crashes (subprocess survives, output files intact)",
                 "Claude Desktop restarts",
+                "long idle periods with no MCP traffic (supervisor keeps ticking)",
             ],
             "does_not_survive": [
                 "container death (all subprocesses die)",
@@ -746,8 +779,11 @@ async def schedule_dispatch(
         channel: Channel for every tick. Same-session continuity
             across ticks (each tick ``--resume``s the prior).
         interval_seconds: Seconds between ticks. Minimum 10.
-        until: Absolute end time, ISO 8601 with TZ
-            (e.g. ``"2026-04-27T20:00:00Z"``). Mutually exclusive with
+        until: Absolute end time, ISO 8601. Prefer including a timezone
+            (e.g. ``"2026-04-27T20:00:00Z"``); naive datetimes without
+            a timezone are interpreted as **UTC**, not local time, so
+            the same string yields the same instant regardless of which
+            container the bridge runs in. Mutually exclusive with
             ``until_seconds``.
         until_seconds: Relative end time in seconds from now (e.g.
             ``14400`` = 4 hours).

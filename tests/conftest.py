@@ -8,11 +8,21 @@ JSON I/O, exit codes, timeouts).
 
 from __future__ import annotations
 
+import gc
 import stat
 import sys
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import pytest
+
+import claude_bridge.dispatcher as _dispatcher_module
+
+if TYPE_CHECKING:
+    import http.server
+    import threading
+
+    from claude_bridge.dispatcher import Dispatcher
 
 
 # Behavior is controlled by env vars set by individual tests:
@@ -118,3 +128,105 @@ def _clear_fake_env(monkeypatch: pytest.MonkeyPatch) -> None:
         "CLAUDE_FAKE_CWD_LOG",
     ):
         monkeypatch.delenv(key, raising=False)
+
+
+# ---------- dispatcher / loopback-server cleanup ----------
+#
+# Tests construct ``Dispatcher`` instances directly, which start a daemon
+# supervisor thread on first ``ensure_watchers_running`` and (in webhook
+# tests) a loopback HTTPServer thread. Without explicit teardown those
+# leak across the suite — the supervisor thread is daemonized so the
+# process exits, but during a test run they accumulate and complicate
+# diagnostics.
+#
+# The autouse cleanup fixture below patches ``Dispatcher.__post_init__``
+# to register every instance, then calls ``.shutdown()`` on each at
+# teardown. The ``capture_server`` fixture wraps the loopback HTTPServer
+# pattern and tears it down properly.
+
+
+_active_dispatchers: list[Dispatcher] = []
+
+
+@pytest.fixture(autouse=True)
+def _cleanup_dispatchers():
+    """Track ``Dispatcher`` instances created during a test and call
+    ``.shutdown()`` on each at teardown so daemon threads don't leak."""
+    _active_dispatchers.clear()
+    original_init = _dispatcher_module.Dispatcher.__post_init__
+
+    def _tracking_post_init(self) -> None:
+        original_init(self)
+        _active_dispatchers.append(self)
+
+    _dispatcher_module.Dispatcher.__post_init__ = _tracking_post_init
+    try:
+        yield
+    finally:
+        _dispatcher_module.Dispatcher.__post_init__ = original_init
+        for d in list(_active_dispatchers):
+            try:
+                d.shutdown()
+            except Exception:  # noqa: BLE001 — never let cleanup fail a test
+                pass
+        _active_dispatchers.clear()
+        gc.collect()
+
+
+@pytest.fixture
+def capture_server():
+    """Spin up a loopback HTTP server that captures POST bodies, hand
+    out a ``(url, received_list)`` factory, and tear the server down at
+    test end so we don't leak threads.
+
+    Usage::
+
+        async def test_x(capture_server):
+            received = []
+            url = capture_server(received)
+            ...
+    """
+    import http.server
+    import json as _json
+    import threading
+
+    servers: list[tuple[http.server.HTTPServer, threading.Thread]] = []
+
+    def _make(received: list[dict]) -> str:
+        class _Handler(http.server.BaseHTTPRequestHandler):
+            def do_POST(self):  # noqa: N802
+                length = int(self.headers.get("Content-Length", "0"))
+                body = self.rfile.read(length).decode("utf-8")
+                try:
+                    received.append(_json.loads(body))
+                except _json.JSONDecodeError:
+                    received.append({"_raw": body})
+                self.send_response(204)
+                self.end_headers()
+
+            def log_message(self, format, *args):  # noqa: A002
+                return
+
+        server = http.server.HTTPServer(("127.0.0.1", 0), _Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        servers.append((server, thread))
+        port = server.server_address[1]
+        return f"http://127.0.0.1:{port}/"
+
+    try:
+        yield _make
+    finally:
+        for server, thread in servers:
+            try:
+                server.shutdown()
+            except Exception:  # noqa: BLE001
+                pass
+            try:
+                server.server_close()
+            except Exception:  # noqa: BLE001
+                pass
+            try:
+                thread.join(timeout=2.0)
+            except Exception:  # noqa: BLE001
+                pass

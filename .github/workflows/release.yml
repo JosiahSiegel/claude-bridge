@@ -1,0 +1,60 @@
+name: release
+
+# Triggered only by pushing a tag like v0.1.0. Requires:
+#   1. The PyPI project ``claude-bridge`` to be configured with a
+#      Trusted Publisher pointing at this repo and the ``release``
+#      environment. See https://docs.pypi.org/trusted-publishers/.
+#   2. A GitHub environment named ``release`` (Settings → Environments).
+#
+# Until both are in place, pushing a tag will fail at the publish step
+# without affecting anything else. Tests still run via tests.yml.
+
+on:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Verify tag matches package version
+        run: |
+          PY_VERSION=$(python -c "import re,sys; m=re.search(r'__version__\s*=\s*\"([^\"]+)\"', open('src/claude_bridge/__init__.py').read()); print(m.group(1))")
+          TAG_VERSION=${GITHUB_REF_NAME#v}
+          if [ "$PY_VERSION" != "$TAG_VERSION" ]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match __version__=$PY_VERSION"
+            exit 1
+          fi
+
+      - name: Build distributions
+        run: |
+          python -m pip install --upgrade pip build
+          python -m build
+
+      - name: Upload distributions
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    environment: release
+    permissions:
+      id-token: write  # required for PyPI trusted publishing (OIDC)
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1

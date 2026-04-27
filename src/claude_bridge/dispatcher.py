@@ -66,8 +66,13 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import datetime as _dt
+import ipaddress
 import json
+import shutil
 import signal
+import socket
+import threading
+import urllib.parse
 import urllib.request
 import os
 import time
@@ -248,6 +253,7 @@ class Job:
     result: dict[str, Any] | None = None
     error: str | None = None
     pid: int | None = None
+    pgid: int | None = None
     output_dir: str | None = None
     notify_url: str | None = None
     notify_on: list[str] = field(default_factory=list)
@@ -266,6 +272,7 @@ class Job:
             "result": self.result,
             "error": self.error,
             "pid": self.pid,
+            "pgid": self.pgid,
             "output_dir": self.output_dir,
             "notify_url": self.notify_url,
             "notify_on": list(self.notify_on),
@@ -284,6 +291,7 @@ class Job:
             result=data.get("result"),
             error=data.get("error"),
             pid=data.get("pid"),
+            pgid=data.get("pgid"),
             output_dir=data.get("output_dir"),
             notify_url=data.get("notify_url"),
             notify_on=list(data.get("notify_on") or []),
@@ -302,9 +310,10 @@ class Dispatcher:
     persist_prompts: bool = False
     log_prompts: bool = False
     max_events: int = 1000
+    allow_private_webhooks: bool = False
     _watcher_poll_seconds: float = field(default=2.0, repr=False)
     _scheduler_poll_seconds: float = field(default=5.0, repr=False)
-    _min_schedule_interval_seconds: float = field(default=10.0, repr=False)
+    min_schedule_interval_seconds: float = field(default=10.0, repr=False)
     _channel_locks: dict[str, asyncio.Lock] = field(default_factory=dict, init=False)
     _watcher_tasks: dict[str, "asyncio.Task[None]"] = field(
         default_factory=dict, init=False, repr=False
@@ -313,22 +322,75 @@ class Dispatcher:
     _scheduler_task: "asyncio.Task[None] | None" = field(
         default=None, init=False, repr=False
     )
-    _schedules_save_lock: asyncio.Lock = field(
-        default_factory=asyncio.Lock, init=False, repr=False
+    # Locks are constructed lazily inside the first async method that
+    # needs them (see ``_get_jobs_save_lock`` / ``_get_schedules_save_lock``
+    # / ``_get_events_save_lock``). This decouples lock construction from
+    # the loop that happens to be running at module import / dispatcher
+    # construction time, which can otherwise bind the lock to the wrong
+    # loop and explode at first use under FastMCP.
+    _jobs_save_lock: "asyncio.Lock | None" = field(
+        default=None, init=False, repr=False
+    )
+    _schedules_save_lock: "asyncio.Lock | None" = field(
+        default=None, init=False, repr=False
+    )
+    _events_save_lock: "asyncio.Lock | None" = field(
+        default=None, init=False, repr=False
     )
     _events: list[dict[str, Any]] = field(default_factory=list, init=False, repr=False)
+    _asyncio_loop: "asyncio.AbstractEventLoop | None" = field(
+        default=None, init=False, repr=False
+    )
+    _supervisor_thread: "threading.Thread | None" = field(
+        default=None, init=False, repr=False
+    )
+    _supervisor_stop: threading.Event = field(
+        default_factory=threading.Event, init=False, repr=False
+    )
+    # ``run_coroutine_threadsafe`` returns a ``concurrent.futures.Future``,
+    # not an asyncio.Future. The supervisor checks this for backpressure
+    # (skip the next tick if the previous one is still pending) and
+    # attaches a done callback to log failures.
+    _supervisor_inflight: "Any | None" = field(
+        default=None, init=False, repr=False
+    )
     _state: dict[str, Any] = field(default_factory=dict, init=False)
     _jobs: dict[str, Job] = field(default_factory=dict, init=False)
-    _jobs_save_lock: asyncio.Lock = field(
-        default_factory=asyncio.Lock, init=False, repr=False
+    _events_save_pending: bool = field(default=False, init=False, repr=False)
+    _events_save_handle: "asyncio.TimerHandle | None" = field(
+        default=None, init=False, repr=False
     )
 
     def __post_init__(self) -> None:
         self._state = self._load_state()
+        # Load events first so subsequent load steps can ``_log_event``
+        # corrupt-entry warnings without losing them to a missing buffer.
+        self._events = self._load_events()
         self._jobs = self._load_jobs()
         self._mark_orphans_on_startup()
         self._schedules = self._load_schedules()
-        self._events = self._load_events()
+
+    # ----- lazy lock helpers -----
+    #
+    # Each save lock is created on first access from inside an async
+    # method, so it binds to whatever loop is actually running the
+    # dispatch — not whichever loop happened to be alive at __init__.
+    # All three locks must only be acquired from a coroutine.
+
+    def _get_jobs_save_lock(self) -> asyncio.Lock:
+        if self._jobs_save_lock is None:
+            self._jobs_save_lock = asyncio.Lock()
+        return self._jobs_save_lock
+
+    def _get_schedules_save_lock(self) -> asyncio.Lock:
+        if self._schedules_save_lock is None:
+            self._schedules_save_lock = asyncio.Lock()
+        return self._schedules_save_lock
+
+    def _get_events_save_lock(self) -> asyncio.Lock:
+        if self._events_save_lock is None:
+            self._events_save_lock = asyncio.Lock()
+        return self._events_save_lock
 
     # ----- state persistence -----
 
@@ -343,10 +405,23 @@ class Dispatcher:
         return {"channels": {}}
 
     def _save_state(self) -> None:
+        # Unique tmp suffix per call: two concurrent dispatches on
+        # different channels both write+rename here unlocked, and a shared
+        # ``.tmp`` name lets one clobber the other's tempfile mid-write,
+        # corrupting the rename target. uuid disambiguates.
         self.state_path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = self.state_path.with_suffix(self.state_path.suffix + ".tmp")
-        tmp.write_text(json.dumps(self._state, indent=2), encoding="utf-8")
-        os.replace(tmp, self.state_path)
+        tmp = self.state_path.with_suffix(
+            self.state_path.suffix + f".tmp.{uuid.uuid4().hex[:8]}"
+        )
+        try:
+            tmp.write_text(json.dumps(self._state, indent=2), encoding="utf-8")
+            os.replace(tmp, self.state_path)
+        except BaseException:
+            # Clean up the tmp file on any failure path so we don't leak
+            # disambiguator-suffixed dead files.
+            with contextlib.suppress(OSError):
+                tmp.unlink()
+            raise
 
     # ----- job persistence -----
 
@@ -360,28 +435,58 @@ class Dispatcher:
             return {}
         try:
             data = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
+        except (OSError, json.JSONDecodeError) as exc:
             # Corrupt jobs file shouldn't take down the bridge — start
             # empty. Channel state in sessions.json is unaffected.
+            self._log_event(
+                "load_jobs_failed",
+                error=f"{type(exc).__name__}: {exc}",
+                path=str(path),
+            )
             return {}
         out: dict[str, Job] = {}
+        dropped = 0
         for entry in data.get("jobs", []):
             try:
                 job = Job.from_persistable(entry)
-            except (KeyError, TypeError, ValueError):
+            except (KeyError, TypeError, ValueError) as exc:
+                dropped += 1
+                self._log_event(
+                    "load_jobs_entry_dropped",
+                    error=f"{type(exc).__name__}: {exc}",
+                    entry_id=str(entry.get("id")) if isinstance(entry, dict) else None,
+                )
                 continue
             out[job.id] = job
+        if dropped:
+            self._log_event(
+                "load_jobs_summary", loaded=len(out), dropped=dropped
+            )
         return out
 
-    def _save_jobs_sync(self) -> None:
-        """Same atomic temp+rename pattern as state. Safe to call before
-        any asyncio loop is running (used during ``__post_init__``)."""
+    def _save_jobs_unlocked(self) -> None:
+        """Atomic temp+rename for the jobs file, with no lock held.
+
+        **Init-only or shielded use.** Safe to call before any asyncio
+        loop is running (used during ``__post_init__``) and from inside
+        the cancel/teardown handlers where awaiting the async lock could
+        re-raise ``CancelledError`` before persistence lands. Concurrent
+        callers from the async path must go through ``_save_jobs``.
+
+        The unique tmp suffix means two unlocked saves overlapping won't
+        clobber each other's tempfile.
+        """
         path = self._jobs_path
         path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = path.with_suffix(path.suffix + ".tmp")
+        tmp = path.with_suffix(path.suffix + f".tmp.{uuid.uuid4().hex[:8]}")
         payload = {"jobs": [j.to_persistable() for j in self._jobs.values()]}
-        tmp.write_text(json.dumps(payload, indent=2), encoding="utf-8")
-        os.replace(tmp, path)
+        try:
+            tmp.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+            os.replace(tmp, path)
+        except BaseException:
+            with contextlib.suppress(OSError):
+                tmp.unlink()
+            raise
 
     async def _save_jobs(self) -> None:
         """Async wrapper that serializes concurrent saves through a lock.
@@ -389,9 +494,17 @@ class Dispatcher:
         Without the lock, two concurrent dispatch_async tasks could both
         write the temp file and rename in an order that loses one of
         their updates.
+
+        Also opportunistically flushes any pending event-log writes —
+        the dispatch lifecycle (``dispatch_start`` / ``dispatch_end`` /
+        ``dispatch_*``) is the natural pacing for "meaningful state
+        changed; persist now" so we don't strand events for the full
+        debounce window.
         """
-        async with self._jobs_save_lock:
-            self._save_jobs_sync()
+        async with self._get_jobs_save_lock():
+            self._save_jobs_unlocked()
+        if self._events_save_pending:
+            await self._flush_events_now()
 
     def _mark_orphans_on_startup(self) -> None:
         """Recover jobs that were in-flight at last write.
@@ -470,7 +583,7 @@ class Dispatcher:
                 state_changed = True
 
         if changed:
-            self._save_jobs_sync()
+            self._save_jobs_unlocked()
         if state_changed:
             self._save_state()
         if changed or state_changed or running_to_finalize:
@@ -499,7 +612,11 @@ class Dispatcher:
         with contextlib.suppress(OSError):
             stderr = (out_dir / "stderr").read_text(encoding="utf-8", errors="replace")
         session_id = job.args.get("session_id") or ""
-        duration_ms = int(((job.finished_at or time.time()) - job.started_at) * 1000)
+        # Same mtime-as-finish-time treatment as ``_finalize_orphan``.
+        finished_at = time.time()
+        with contextlib.suppress(OSError):
+            finished_at = (out_dir / "stdout").stat().st_mtime
+        duration_ms = int(max(0.0, finished_at - job.started_at) * 1000)
         result = self._finalize_payload(
             channel=job.channel,
             session_id=str(session_id),
@@ -511,7 +628,7 @@ class Dispatcher:
         job.status = "done" if result.ok else "error"
         job.result = result.to_dict()
         job.error = None if result.ok else result.error
-        job.finished_at = time.time()
+        job.finished_at = finished_at
 
     # ----- schedule persistence -----
 
@@ -525,30 +642,84 @@ class Dispatcher:
             return {}
         try:
             data = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
+        except (OSError, json.JSONDecodeError) as exc:
+            self._log_event(
+                "load_schedules_failed",
+                error=f"{type(exc).__name__}: {exc}",
+                path=str(path),
+            )
             return {}
         out: dict[str, Schedule] = {}
+        dropped = 0
         for entry in data.get("schedules", []):
             try:
                 sched = Schedule.from_persistable(entry)
-            except (KeyError, TypeError, ValueError):
+            except (KeyError, TypeError, ValueError) as exc:
+                dropped += 1
+                self._log_event(
+                    "load_schedules_entry_dropped",
+                    error=f"{type(exc).__name__}: {exc}",
+                    entry_id=str(entry.get("id")) if isinstance(entry, dict) else None,
+                )
                 continue
             out[sched.id] = sched
+        # Detect cycles in persisted chains and quarantine offenders to
+        # ``error`` status so a corrupt file doesn't deadlock the
+        # scheduler. Cycles can't be created via ``create_schedule``
+        # (that path validates), but the on-disk file is mutable and
+        # we should be defensive.
+        for sched in list(out.values()):
+            if not sched.after_schedule_id:
+                continue
+            seen: set[str] = {sched.id}
+            cur = sched.after_schedule_id
+            while cur is not None:
+                if cur in seen:
+                    sched.status = "error"
+                    sched.error = (
+                        f"persisted after_schedule_id chain has a cycle "
+                        f"involving {cur}; quarantined on load"
+                    )
+                    self._log_event(
+                        "load_schedules_cycle_quarantined",
+                        schedule_id=sched.id,
+                        cycle_at=cur,
+                    )
+                    break
+                seen.add(cur)
+                step = out.get(cur)
+                cur = step.after_schedule_id if step else None
+        if dropped:
+            self._log_event(
+                "load_schedules_summary", loaded=len(out), dropped=dropped
+            )
         return out
 
-    def _save_schedules_sync(self) -> None:
+    def _save_schedules_unlocked(self) -> None:
+        """Atomic temp+rename for the schedules file, with no lock held.
+
+        Same init-only-or-shielded contract as ``_save_jobs_unlocked``.
+        Concurrent async callers must go through ``_save_schedules``.
+        """
         path = self._schedules_path
         path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = path.with_suffix(path.suffix + ".tmp")
+        tmp = path.with_suffix(path.suffix + f".tmp.{uuid.uuid4().hex[:8]}")
         payload = {
             "schedules": [s.to_persistable() for s in self._schedules.values()]
         }
-        tmp.write_text(json.dumps(payload, indent=2), encoding="utf-8")
-        os.replace(tmp, path)
+        try:
+            tmp.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+            os.replace(tmp, path)
+        except BaseException:
+            with contextlib.suppress(OSError):
+                tmp.unlink()
+            raise
 
     async def _save_schedules(self) -> None:
-        async with self._schedules_save_lock:
-            self._save_schedules_sync()
+        async with self._get_schedules_save_lock():
+            self._save_schedules_unlocked()
+        if self._events_save_pending:
+            await self._flush_events_now()
 
     # ----- structured event log -----
     #
@@ -582,13 +753,78 @@ class Dispatcher:
             return []
         return list(raw)[-self.max_events :]
 
-    def _save_events_sync(self) -> None:
+    # Debounce window for the events.json mirror. Many events fire in
+    # tight bursts (a single dispatch generates start/end plus possibly
+    # webhook records); writing the whole file synchronously on each
+    # call dominates the dispatch latency. We coalesce within this
+    # window via a short timer.
+    _EVENTS_SAVE_DEBOUNCE_SECONDS = 0.1
+
+    def _save_events_unlocked(self) -> None:
+        """Atomic temp+rename for the events file, with no lock held.
+
+        Init-only or shielded contract; concurrent async callers route
+        through the debounced ``_schedule_events_save`` helper which
+        acquires the proper lock.
+        """
         path = self._events_path
         path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = path.with_suffix(path.suffix + ".tmp")
-        payload = {"events": self._events}
-        tmp.write_text(json.dumps(payload, default=str), encoding="utf-8")
-        os.replace(tmp, path)
+        tmp = path.with_suffix(path.suffix + f".tmp.{uuid.uuid4().hex[:8]}")
+        # Snapshot the buffer so a concurrent append from another
+        # coroutine doesn't see a half-serialized state.
+        payload = {"events": list(self._events)}
+        try:
+            tmp.write_text(json.dumps(payload, default=str), encoding="utf-8")
+            os.replace(tmp, path)
+        except BaseException:
+            with contextlib.suppress(OSError):
+                tmp.unlink()
+            raise
+
+    async def _flush_events_now(self) -> None:
+        """Force-write the events buffer through the lock + executor.
+
+        Used by the debounced timer callback and by the test surface.
+        Failures are swallowed: the in-memory buffer is the source of
+        truth; events.json is best-effort persistence for restart
+        recovery.
+        """
+        loop = asyncio.get_running_loop()
+        async with self._get_events_save_lock():
+            self._events_save_pending = False
+            try:
+                await loop.run_in_executor(None, self._save_events_unlocked)
+            except OSError:
+                pass
+
+    def _schedule_events_save(self) -> None:
+        """Mark the events buffer dirty; coalesce flushes within
+        ``_EVENTS_SAVE_DEBOUNCE_SECONDS``.
+
+        If no asyncio loop is running we fall back to the sync save so
+        ``_log_event`` still persists during ``__post_init__``.
+        """
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            with contextlib.suppress(OSError):
+                self._save_events_unlocked()
+            return
+        self._events_save_pending = True
+        # Already armed; nothing more to do.
+        existing = self._events_save_handle
+        if existing is not None and not existing.cancelled():
+            return
+
+        def _arm_flush() -> None:
+            self._events_save_handle = None
+            if not self._events_save_pending:
+                return
+            asyncio.ensure_future(self._flush_events_now(), loop=loop)
+
+        self._events_save_handle = loop.call_later(
+            self._EVENTS_SAVE_DEBOUNCE_SECONDS, _arm_flush
+        )
 
     def _log_event(self, event: str, **fields: Any) -> None:
         """Append a structured event. Hits the in-memory buffer plus the
@@ -598,6 +834,10 @@ class Dispatcher:
         log path never takes down a dispatch. Prompts are excluded by
         default; opt in via ``log_prompts=True`` (or
         ``CLAUDE_BRIDGE_LOG_PROMPTS=1``).
+
+        The ``events.json`` mirror is debounced inside a running loop
+        (so a tight burst of events triggers one disk write, not N).
+        Without a loop (init/recovery), the write happens inline.
         """
         record: dict[str, Any] = {
             "ts": time.time(),
@@ -608,10 +848,7 @@ class Dispatcher:
         self._events.append(record)
         if len(self._events) > self.max_events:
             self._events = self._events[-self.max_events :]
-        try:
-            self._save_events_sync()
-        except OSError:
-            pass
+        self._schedule_events_save()
 
         # Optional human-readable JSONL file.
         if self.log_path is None:
@@ -671,6 +908,81 @@ class Dispatcher:
 
     _WEBHOOK_MAX_RESULT_CHARS = 4096
     _WEBHOOK_TIMEOUT_SECONDS = 10.0
+
+    def _validate_notify_url(self, url: str) -> str | None:
+        """Reject webhook URLs that would let an MCP caller pivot to
+        services running on the bridge's container/network.
+
+        Returns ``None`` on success, or a human-readable error string.
+
+        Rules:
+
+        * Scheme must be ``http`` or ``https``.
+        * Host must resolve (or already be a literal IP). If it resolves
+          to any private/loopback/link-local address, reject — unless
+          ``allow_private_webhooks=True`` (env-flagged for tests and
+          users with a relay running locally).
+
+        IP literals are checked against ``ipaddress`` directly (no DNS).
+        Hostnames are resolved via ``socket.getaddrinfo``; resolution
+        failures reject with a clear error.
+        """
+        try:
+            parsed = urllib.parse.urlparse(url)
+        except (ValueError, TypeError) as exc:
+            return f"invalid notify_url: {exc}"
+        scheme = (parsed.scheme or "").lower()
+        if scheme not in ("http", "https"):
+            return (
+                f"notify_url scheme must be http or https; got {scheme!r}"
+            )
+        host = parsed.hostname
+        if not host:
+            return "notify_url is missing a host"
+
+        # IP literal: check directly without DNS.
+        try:
+            ip = ipaddress.ip_address(host)
+        except ValueError:
+            ip = None
+        candidates: list[Any]
+        if ip is not None:
+            candidates = [ip]
+        else:
+            try:
+                infos = socket.getaddrinfo(host, None)
+            except socket.gaierror as exc:
+                return f"notify_url host did not resolve: {host} ({exc})"
+            candidates = []
+            for info in infos:
+                sockaddr = info[4]
+                addr = sockaddr[0] if sockaddr else None
+                if not addr:
+                    continue
+                try:
+                    candidates.append(ipaddress.ip_address(addr))
+                except ValueError:
+                    continue
+            if not candidates:
+                return f"notify_url host produced no usable address: {host}"
+
+        if self.allow_private_webhooks:
+            return None
+        for cand in candidates:
+            if (
+                cand.is_loopback
+                or cand.is_link_local
+                or cand.is_private
+                or cand.is_multicast
+                or cand.is_reserved
+                or cand.is_unspecified
+            ):
+                return (
+                    f"notify_url resolves to a private/loopback address "
+                    f"({cand}); set CLAUDE_BRIDGE_ALLOW_PRIVATE_WEBHOOKS=1 "
+                    f"to allow this"
+                )
+        return None
 
     @staticmethod
     def _truncate_for_webhook(s: str | None) -> str | None:
@@ -1022,10 +1334,18 @@ class Dispatcher:
                     error=f"{self.claude_bin!r} not on PATH inside the container",
                 )
 
-            # Persist the PID and output dir BEFORE awaiting completion.
-            # If we crash here, recovery on restart will find the running
-            # subprocess and pick up where we left off.
+            # Persist the PID + PGID and output dir BEFORE awaiting
+            # completion. If we crash here, recovery on restart will
+            # find the running subprocess and pick up where we left off.
+            #
+            # PGID is captured immediately while we know the PID is ours.
+            # Reading it later via ``os.getpgid(proc.pid)`` is unsafe
+            # under PID recycling: if the kernel recycled the PID after
+            # the subprocess exited, getpgid would resolve some unrelated
+            # process's group and ``killpg`` would target the wrong tree.
             job.pid = proc.pid
+            with contextlib.suppress(ProcessLookupError, PermissionError, OSError):
+                job.pgid = os.getpgid(proc.pid)
             job.output_dir = str(out_dir)
             job.args["session_id"] = session_id
             await self._save_jobs()
@@ -1033,8 +1353,13 @@ class Dispatcher:
             try:
                 await asyncio.wait_for(proc.wait(), timeout=timeout_seconds)
             except asyncio.TimeoutError:
-                with contextlib.suppress(ProcessLookupError):
-                    os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+                target_pgid = job.pgid
+                if target_pgid is not None:
+                    with contextlib.suppress(ProcessLookupError, PermissionError):
+                        os.killpg(target_pgid, signal.SIGKILL)
+                else:
+                    with contextlib.suppress(ProcessLookupError):
+                        proc.kill()
                 with contextlib.suppress(ProcessLookupError):
                     await proc.wait()
                 return DispatchResult(
@@ -1127,8 +1452,16 @@ class Dispatcher:
         try:
             while self._is_pid_alive(job.pid):
                 if job.cancel_requested:
-                    with contextlib.suppress(ProcessLookupError, PermissionError):
-                        os.killpg(os.getpgid(job.pid), signal.SIGKILL)
+                    target_pgid = job.pgid
+                    if target_pgid is not None:
+                        with contextlib.suppress(ProcessLookupError, PermissionError):
+                            os.killpg(target_pgid, signal.SIGKILL)
+                    else:
+                        # Fall back to PID-only kill. Less complete (won't
+                        # reach grandchildren) but still safer than calling
+                        # getpgid here, which can resolve a recycled PID.
+                        with contextlib.suppress(ProcessLookupError, PermissionError):
+                            os.kill(job.pid, signal.SIGKILL)
                 await asyncio.sleep(self._watcher_poll_seconds)
         except asyncio.CancelledError:
             # Watcher itself cancelled (e.g. bridge shutdown). Leave the
@@ -1165,7 +1498,15 @@ class Dispatcher:
             stderr = (out_dir / "stderr").read_text(encoding="utf-8", errors="replace")
 
         session_id = job.args.get("session_id") or ""
-        duration_ms = int(((job.finished_at or time.time()) - job.started_at) * 1000)
+        # Prefer the stdout file's mtime as a proxy for "when the
+        # subprocess actually finished writing", which is more accurate
+        # than ``time.time()`` for orphans recovered after the bridge
+        # was down. ``time.time()`` is only the fallback when the file
+        # is missing or unstattable.
+        finished_at = time.time()
+        with contextlib.suppress(OSError):
+            finished_at = (out_dir / "stdout").stat().st_mtime
+        duration_ms = int(max(0.0, finished_at - job.started_at) * 1000)
         # We don't know the actual returncode. If the JSON parses cleanly
         # we treat the run as successful; otherwise as an error.
         result = self._finalize_payload(
@@ -1179,7 +1520,7 @@ class Dispatcher:
         job.status = "done" if result.ok else "error"
         job.result = result.to_dict()
         job.error = None if result.ok else result.error
-        job.finished_at = time.time()
+        job.finished_at = finished_at
         await self._save_jobs()
         self._log_event(
             "dispatch_orphan_finalized",
@@ -1189,24 +1530,145 @@ class Dispatcher:
         )
 
     async def ensure_watchers_running(self) -> None:
-        """Spawn watchers for any persisted ``running`` jobs and bring up
-        the scheduler loop if it isn't already running.
+        """Spawn watchers for any persisted ``running`` jobs, bring up
+        the scheduler loop if it isn't already running, and start the
+        wall-clock supervisor thread.
 
-        Called from every async MCP tool entry. Safe and cheap to call
-        repeatedly; only spawns one watcher per job and one scheduler
-        task per Dispatcher.
+        Called from every async MCP tool entry AND periodically from the
+        supervisor thread (so liveness doesn't depend on FastMCP keeping
+        a task alive — see ``_supervisor_loop`` for the why).
+
+        Safe and cheap to call repeatedly: only spawns one watcher per
+        job, one scheduler task, and one supervisor thread per
+        Dispatcher.
         """
+        try:
+            self._asyncio_loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        self._start_supervisor_thread()
         for job in self._jobs.values():
             if job.status == "running" and job.task is None:
                 self._spawn_watcher(job)
         if self._scheduler_task is None or self._scheduler_task.done():
-            try:
-                loop = asyncio.get_running_loop()
-            except RuntimeError:
-                return
-            self._scheduler_task = loop.create_task(
+            self._scheduler_task = self._asyncio_loop.create_task(
                 self._scheduler_loop(), name="bridge-scheduler"
             )
+
+    def _start_supervisor_thread(self) -> None:
+        """Daemon thread that re-runs ``ensure_watchers_running`` on a
+        wall-clock cadence.
+
+        Why this exists: FastMCP's transport-disconnect path cancels
+        in-flight asyncio tasks, which can take down the scheduler task
+        and any active watcher tasks. Before this thread, the scheduler
+        only revived when the next async MCP tool entry called
+        ``ensure_watchers_running`` — and if no tool was called for an
+        hour, no ticks fired for an hour. The daemon thread closes
+        that gap: once per ``_scheduler_poll_seconds``, it schedules
+        ``ensure_watchers_running`` on the asyncio loop via
+        ``run_coroutine_threadsafe``. The thread itself is outside
+        FastMCP's cancellation scope.
+
+        The thread exits cleanly when the asyncio loop closes or when
+        ``shutdown()`` is called.
+        """
+        if (
+            self._supervisor_thread is not None
+            and self._supervisor_thread.is_alive()
+        ):
+            return
+        self._supervisor_stop.clear()
+        thread = threading.Thread(
+            target=self._supervisor_loop,
+            name="bridge-supervisor",
+            daemon=True,
+        )
+        self._supervisor_thread = thread
+        thread.start()
+
+    def _supervisor_loop(self) -> None:
+        # First sleep is short so the test surface doesn't have to wait
+        # a full poll interval before the thread does its first tick.
+        first = True
+        while not self._supervisor_stop.is_set():
+            interval = self._scheduler_poll_seconds if not first else 0.05
+            first = False
+            if self._supervisor_stop.wait(interval):
+                return
+            loop = self._asyncio_loop
+            if loop is None or loop.is_closed():
+                return
+            # Backpressure: if the previous tick's coroutine hasn't
+            # finished yet, skip this tick. We just drop through to the
+            # next iteration of the outer ``while`` (which will ``wait``
+            # one more interval) — never tight-loop.
+            inflight = self._supervisor_inflight
+            if inflight is not None and not inflight.done():
+                continue
+            try:
+                fut = asyncio.run_coroutine_threadsafe(
+                    self.ensure_watchers_running(), loop
+                )
+            except RuntimeError:
+                # Loop was closed between our check and our call.
+                return
+            except Exception:  # noqa: BLE001 — never let the supervisor die
+                # Best-effort: log and try again next interval.
+                with contextlib.suppress(Exception):
+                    self._log_event("supervisor_dispatch_error")
+                continue
+            self._supervisor_inflight = fut
+
+            def _log_failure(f: Any) -> None:
+                # ``f`` is a concurrent.futures.Future; both .cancelled()
+                # and .exception() are sync and don't block here because
+                # we're inside the done callback.
+                try:
+                    if f.cancelled():
+                        return
+                    exc = f.exception()
+                except Exception:  # noqa: BLE001
+                    return
+                if exc is None:
+                    return
+                with contextlib.suppress(Exception):
+                    self._log_event(
+                        "supervisor_dispatch_error",
+                        error=f"{type(exc).__name__}: {exc}",
+                    )
+
+            with contextlib.suppress(Exception):
+                fut.add_done_callback(_log_failure)
+
+    def shutdown(self) -> None:
+        """Stop the supervisor thread and ask the scheduler to exit.
+
+        Used in tests and on graceful shutdown. Idempotent. Tolerates
+        being called after the asyncio loop has closed (e.g. from a
+        sync pytest fixture finalizer).
+
+        Also cancels the debounced events flush timer and writes any
+        pending events synchronously, so a test that calls
+        ``shutdown()`` doesn't lose the last burst.
+        """
+        self._supervisor_stop.set()
+        thread = self._supervisor_thread
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=2.0)
+        task = self._scheduler_task
+        if task is not None and not task.done():
+            with contextlib.suppress(Exception):
+                task.cancel()
+        handle = self._events_save_handle
+        if handle is not None:
+            with contextlib.suppress(Exception):
+                handle.cancel()
+            self._events_save_handle = None
+        if self._events_save_pending:
+            self._events_save_pending = False
+            with contextlib.suppress(OSError):
+                self._save_events_unlocked()
 
     # ----- recurring dispatches (schedules) -----
 
@@ -1406,15 +1868,19 @@ class Dispatcher:
             return {"ok": False, "error": "prompt is empty"}
         if not channel.strip():
             return {"ok": False, "error": "channel is empty"}
-        if interval_seconds < self._min_schedule_interval_seconds:
+        if interval_seconds < self.min_schedule_interval_seconds:
             return {
                 "ok": False,
                 "error": (
                     f"interval_seconds must be at least "
-                    f"{self._min_schedule_interval_seconds}s "
+                    f"{self.min_schedule_interval_seconds}s "
                     "(prevents runaway tick storms)"
                 ),
             }
+        if notify_url is not None:
+            err = self._validate_notify_url(notify_url)
+            if err is not None:
+                return {"ok": False, "error": err}
         if until is not None and until_seconds is not None:
             return {
                 "ok": False,
@@ -1501,14 +1967,22 @@ class Dispatcher:
     @staticmethod
     def _parse_until(s: str) -> float | None:
         """Parse an ISO 8601 string into an epoch timestamp; ``None`` on
-        failure. Python 3.11's ``fromisoformat`` accepts the trailing ``Z``."""
+        failure. Python 3.11's ``fromisoformat`` accepts the trailing ``Z``.
+
+        **Naive datetimes are treated as UTC**, not local time. The
+        bridge runs inside a container whose clock may not match the
+        caller's; "2026-04-27T20:00:00" without a TZ designator could
+        otherwise resolve to wildly different epoch instants depending
+        on the container's TZ. UTC-by-default is documented in
+        ``schedule_dispatch``'s tool docstring and ``bridge_help``'s
+        ``concepts.schedule_chaining``.
+        """
         try:
             dt = _dt.datetime.fromisoformat(s)
         except ValueError:
             return None
         if dt.tzinfo is None:
-            # Naive — treat as local time, same as datetime.timestamp() does.
-            return dt.timestamp()
+            dt = dt.replace(tzinfo=_dt.timezone.utc)
         return dt.timestamp()
 
     def list_schedules(self) -> list[dict[str, Any]]:
@@ -1549,19 +2023,33 @@ class Dispatcher:
     def list_completions(
         self, since: float = 0.0, limit: int = 50
     ) -> list[dict[str, Any]]:
-        """Jobs whose ``finished_at > since``, oldest finish first."""
-        out: list[dict[str, Any]] = []
+        """Jobs whose ``finished_at > since``, oldest finish first.
+
+        Filter on ``Job.finished_at`` *before* materializing entries via
+        ``get_dispatch`` so a long-lived bridge with thousands of jobs
+        only pays the entry-construction cost on the survivors. Sort
+        and limit on the cheap ``(finished_at, job)`` tuples, then build
+        full entries only for the items that will actually be returned.
+        """
+        # Cheap filter + sort on (finished_at, job).
+        survivors: list[tuple[float, Job]] = []
         for job in self._jobs.values():
             fin = job.finished_at
             if fin is None or fin <= since:
                 continue
+            survivors.append((fin, job))
+        survivors.sort(key=lambda kv: kv[0])
+        if limit > 0:
+            survivors = survivors[:limit]
+
+        out: list[dict[str, Any]] = []
+        for fin, job in survivors:
             entry = self.get_dispatch(job.id)
             if "raw" in entry:
                 entry = {k: v for k, v in entry.items() if k != "raw"}
             entry["finished_at"] = fin
             out.append(entry)
-        out.sort(key=lambda e: e.get("finished_at") or 0.0)
-        return out[:limit] if limit > 0 else out
+        return out
 
     async def wait_any_completion(
         self, since: float = 0.0, max_wait_seconds: float = 50.0
@@ -1596,6 +2084,10 @@ class Dispatcher:
         Called *before* inserting a new job: if we're already at or above
         the cap, evict the oldest terminal entries to leave room for the
         incoming job. Running jobs are never evicted.
+
+        Eviction also removes the job's on-disk output directory under
+        ``job-output/<job_id>/`` so a long-lived bridge doesn't leak
+        bytes for jobs that no caller can ever look up again.
         """
         if len(self._jobs) < self.max_completed_jobs:
             return
@@ -1610,6 +2102,9 @@ class Dispatcher:
         to_drop = len(self._jobs) - self.max_completed_jobs + 1
         for jid, _ in finished[: max(to_drop, 0)]:
             self._jobs.pop(jid, None)
+            evicted_dir = self._jobs_output_dir / jid
+            with contextlib.suppress(OSError):
+                shutil.rmtree(evicted_dir, ignore_errors=True)
 
     async def dispatch_async(
         self,
@@ -1638,6 +2133,10 @@ class Dispatcher:
         """
         if not prompt.strip():
             raise ValueError("prompt is empty")
+        if notify_url is not None:
+            err = self._validate_notify_url(notify_url)
+            if err is not None:
+                raise ValueError(err)
         self._evict_completed_if_needed()
         job_id = str(uuid.uuid4())
         args = {
@@ -1659,7 +2158,8 @@ class Dispatcher:
             notify_headers=dict(notify_headers or {}),
         )
         self._jobs[job_id] = job
-        await self._save_jobs()
+        # Log first so ``_save_jobs``'s opportunistic event-flush picks
+        # up ``dispatch_start`` in the same disk write as the new job.
         log_fields: dict[str, Any] = {
             "job_id": job_id,
             "channel": channel,
@@ -1670,6 +2170,7 @@ class Dispatcher:
         if self.log_prompts:
             log_fields["prompt"] = prompt
         self._log_event("dispatch_start", **log_fields)
+        await self._save_jobs()
 
         coro = self._tracked_dispatch(
             job,
@@ -1679,7 +2180,25 @@ class Dispatcher:
             permission_mode=permission_mode,
             cwd=cwd,
         )
-        job.task = asyncio.create_task(coro, name=f"dispatch:{job_id}")
+        try:
+            job.task = asyncio.create_task(coro, name=f"dispatch:{job_id}")
+        except RuntimeError as exc:
+            # Loop closed / no running loop. Mark the job error and persist
+            # so callers see a definite failure rather than an in-memory
+            # ``running`` placeholder that will never finish.
+            coro.close()
+            job.status = "error"
+            job.error = f"failed to schedule dispatch task: {exc}"
+            job.finished_at = time.time()
+            with contextlib.suppress(OSError):
+                self._save_jobs_unlocked()
+            self._log_event(
+                "dispatch_error",
+                job_id=job.id,
+                channel=job.channel,
+                error=job.error,
+            )
+            raise
         return job_id
 
     async def _tracked_dispatch(
@@ -1729,27 +2248,45 @@ class Dispatcher:
                 # Spawn a watcher that will reap this orphan when it exits.
                 self._spawn_watcher(job)
             job.finished_at = time.time()
-            await self._save_jobs()
-            await self._maybe_notify_job(job, job.status)
+            # CancelledError handler: ``await self._save_jobs()`` here can
+            # re-raise the cancellation before persistence lands during
+            # interpreter teardown. Use the unlocked sync writers so the
+            # job's terminal state always makes it to disk along with
+            # the event we just logged. The webhook call gets a
+            # shield+suppress for the same reason — it must not eat the
+            # persistence guarantee, and we don't want a slow webhook
+            # delivery to delay the re-raise either.
+            with contextlib.suppress(OSError):
+                self._save_jobs_unlocked()
+            with contextlib.suppress(OSError):
+                self._save_events_unlocked()
+                self._events_save_pending = False
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await asyncio.shield(
+                    self._maybe_notify_job(job, job.status)
+                )
             raise
         except Exception as exc:
             job.status = "error"
             job.error = f"{type(exc).__name__}: {exc}"
             job.finished_at = time.time()
-            await self._save_jobs()
             self._log_event(
                 "dispatch_error",
                 job_id=job.id,
                 channel=job.channel,
                 error=job.error,
             )
+            await self._save_jobs()
             await self._maybe_notify_job(job, "error")
             raise
 
         job.status = "done"
         job.finished_at = time.time()
         job.result = result.to_dict()
-        await self._save_jobs()
+        # Log first, then persist — so ``_save_jobs``'s opportunistic
+        # event-flush includes ``dispatch_end`` and a caller that reads
+        # ``events.json`` immediately after ``wait_dispatch`` returns
+        # sees the terminal record (not just the in-memory buffer).
         self._log_event(
             "dispatch_end",
             job_id=job.id,
@@ -1758,6 +2295,7 @@ class Dispatcher:
             duration_ms=result.duration_ms,
             exit_code=result.exit_code,
         )
+        await self._save_jobs()
         await self._maybe_notify_job(job, "done")
         return result
 
@@ -1860,11 +2398,14 @@ class Dispatcher:
         """Request cancellation of a running job.
 
         Two-step cancel: set ``cancel_requested`` (so ``_tracked_dispatch``
-        knows this came from the user), SIGTERM the subprocess by PID
-        (so the work actually stops, even if the asyncio task was lost
-        somehow), and cancel the task. Returns ``{"cancelled": true}``
-        if anything was actionable; ``{"cancelled": false}`` for jobs
-        that have already finished.
+        knows this came from the user), SIGTERM the subprocess group via
+        the *captured-at-spawn* pgid (so we don't ask the kernel to
+        resolve a possibly-recycled PID), and cancel the task. Returns
+        ``{"cancelled": true}`` if anything was actionable.
+
+        ``cancelled`` reflects the *actual* return value of
+        ``task.cancel()`` — a task that was already on the verge of
+        completing may report ``cancelled=false`` even though we asked.
         """
         job = self._jobs.get(job_id)
         if job is None:
@@ -1887,15 +2428,20 @@ class Dispatcher:
                 "status": job.status,
             }
         job.cancel_requested = True
-        # Try to SIGTERM the subprocess if we have its PID. Always
-        # safe — ``os.kill`` raises ProcessLookupError if the PID is
-        # gone, which we suppress.
-        if job.pid is not None:
+        # Use the captured pgid, not getpgid(pid) — the latter races
+        # with PID recycling once the subprocess has exited.
+        target_pgid = job.pgid
+        if target_pgid is not None:
             with contextlib.suppress(ProcessLookupError, PermissionError):
-                os.killpg(os.getpgid(job.pid), signal.SIGTERM)
+                os.killpg(target_pgid, signal.SIGTERM)
+        elif job.pid is not None:
+            # No pgid stored (older persisted record) — fall back to PID.
+            with contextlib.suppress(ProcessLookupError, PermissionError):
+                os.kill(job.pid, signal.SIGTERM)
+        actually_cancelled = True
         if task is not None and not task.done():
-            task.cancel()
-        return {**base, "cancelled": True}
+            actually_cancelled = task.cancel()
+        return {**base, "cancelled": bool(actually_cancelled)}
 
     def list_jobs(self) -> list[dict[str, Any]]:
         """Return one summary dict per tracked job (running + finished).

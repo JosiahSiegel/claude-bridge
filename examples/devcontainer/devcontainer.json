@@ -1,0 +1,27 @@
+{
+  "_comment_1": "Reference devcontainer.json showing how to wire claude-bridge for autonomous Cowork operation. Copy into your project's .devcontainer/ directory and adjust as needed.",
+  "_comment_2": "After the container is up, find its name with `docker ps` and add the matching mcpServers entry to your host's claude_desktop_config.json (see examples/cowork-mcp-config.json).",
+
+  "name": "claude-bridge demo",
+  "build": { "dockerfile": "Dockerfile" },
+
+  "containerEnv": {
+    "_comment": "Anchor the bridge in a clean directory by default. Per-call cwd= overrides this; pointing CLAUDE_BRIDGE_CWD at a busy project means every dispatch pays its cold-start cost.",
+    "CLAUDE_BRIDGE_CWD": "/home/vscode/bridge-workspace",
+
+    "_comment_2": "Default to acceptEdits. Switch to bypassPermissions ONLY if the container's network / filesystem isolation is actively keeping you safe — see the official devcontainer guide.",
+    "CLAUDE_BRIDGE_DEFAULT_PERMISSION_MODE": "acceptEdits",
+
+    "_comment_3": "Opt in to the structured event log. Path is inside the container; the bridge creates the file on first event.",
+    "CLAUDE_BRIDGE_LOG": "/home/vscode/.claude-bridge/bridge.log"
+  },
+
+  "remoteUser": "vscode",
+
+  "postCreateCommand": "mkdir -p /home/vscode/bridge-workspace /home/vscode/.claude-bridge && claude-bridge < /dev/null && echo 'claude-bridge loaded successfully'",
+
+  "_comment_3": "If you authenticate Claude Code via `claude /login`, mount ~/.claude as a volume so credentials survive container rebuilds.",
+  "mounts": [
+    "source=${localEnv:HOME}/.claude,target=/home/vscode/.claude,type=bind,consistency=cached"
+  ]
+}
